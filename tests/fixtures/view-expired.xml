@@ -1,0 +1,2 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<partial-response><error><error-name>class javax.faces.application.ViewExpiredException</error-name><error-message><![CDATA[viewId:/page/resultado.xhtml - View /page/resultado.xhtml could not be restored.]]></error-message></error></partial-response>
