@@ -51,7 +51,7 @@ export function parseCli(argv: string[]): CliOptions {
       String(DEFAULT_OPTIONS.minDelay),
     )
     .option("--out <dir>", "directorio de salida", DEFAULT_OPTIONS.out)
-    .option("--fresh", "borrar el estado previo y scrapear desde cero (por defecto se retoma)")
+    .option("--fresh", "borrar los artefactos del scraper dentro de --out y empezar desde cero")
     .option("--quiet", "solo errores y resumen final")
     .showHelpAfterError()
     .parse(argv);

@@ -31,7 +31,7 @@ export interface CliOptions {
   minDelay: number;
   /** Directorio de salida. */
   out: string;
-  /** Borrar el estado previo (scraper.sqlite) y scrapear desde cero. */
+  /** Borrar los artefactos controlados del workspace y scrapear desde cero. */
   fresh: boolean;
   /** Solo errores y resumen. */
   quiet: boolean;
@@ -51,6 +51,24 @@ export const DEFAULT_OPTIONS: CliOptions = {
   fresh: false,
   quiet: false,
 };
+
+export interface RunScope {
+  query: string;
+  corte: string;
+  especialidad: string;
+  anio: string;
+}
+
+/** Canonicalizes the complete search identity before it reaches persistence. */
+export function normalizeRunScope(scope: RunScope): RunScope {
+  const normalize = (value: string): string => value.normalize("NFKC").trim().replace(/\s+/g, " ");
+  return {
+    query: normalize(scope.query),
+    corte: normalize(scope.corte),
+    especialidad: normalize(scope.especialidad),
+    anio: normalize(scope.anio),
+  };
+}
 
 /** Metadata de la card de resultados (una fila). */
 export interface CardRecord {
@@ -176,12 +194,7 @@ export interface FullRecord {
 }
 
 /** Filtros de búsqueda (lo que llena el form). */
-export interface SearchFilters {
-  query: string;
-  corte: string;
-  especialidad?: string;
-  anio?: string;
-}
+export interface SearchFilters extends RunScope {}
 
 /**
  * Campos base del formulario de búsqueda que el servidor JSF espera.
