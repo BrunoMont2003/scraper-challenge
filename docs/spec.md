@@ -250,8 +250,11 @@ npm run scrape -- --query "homicidio"
 # Correr todo el sitio (búsqueda vacía, Corte Suprema ~209K docs)
 npm run scrape
 
-# Reintentar fallidos / retomar interrumpido
-npm run scrape -- --resume
+# Re-correr es seguro: retoma y reintenta fallidos (idempotente)
+npm run scrape -- --query "homicidio"
+
+# Empezar de cero
+npm run scrape -- --query "homicidio" --fresh
 
 npm run build          # tsc
 npm run typecheck      # tsc --noEmit
@@ -261,7 +264,7 @@ npm test               # vitest (offline, fixtures)
 Flags: `--query <texto>` (default vacío), `--corte <1|2>`,
 `--especialidad <id>`, `--anio <aaaa>`, `--pages <N>` (limitar demo),
 `--max-files <N>` (limitar descargas), `--concurrency <N>`,
-`--min-delay <ms>`, `--out <dir>`, `--resume`.
+`--min-delay <ms>`, `--out <dir>`, `--fresh`, `--quiet`.
 
 ## Project Structure
 
@@ -324,8 +327,8 @@ export function parseResultsPage(html: string): {
   decrease) + honorar `Retry-After` (segundos o fecha HTTP, con clamp).
 - Retry por request: full-jitter exponential backoff
   (`random(0, min(cap, base * 2^attempt))`), máx 5-7 intentos.
-- Tras agotar intentos → marcar `failed` en la cola (se reintenta con
-  `--resume`), nunca abortar la corrida.
+- Tras agotar intentos → marcar `failed` en la cola (se reintenta en la
+  siguiente corrida, la cola es idempotente), nunca abortar la corrida.
 - Delay mínimo entre requests (`--min-delay`, default 500ms) + jitter.
 - 5xx y timeouts: mismo tratamiento que 429 (el sitio arroja 500 bajo carga).
 
@@ -402,7 +405,7 @@ data/
 - [ ] `--query "homicidio"` → 410 páginas, 4.094 registros únicos (0 dup uuid).
 - [ ] Por documento: card + ficha completa (~40 campos) + PDF + Word.
 - [ ] Descargas de muestra sin 429 sostenido (AIMD regula).
-- [ ] Interrumpir a mitad → `--resume` retoma sin re-crawlear ni re-descargar.
+- [ ] Interrumpir a mitad → re-correr retoma sin re-crawlear ni re-descargar.
 - [ ] 429/5xx → retry con jitter; `failed.jsonl` con los fallidos.
 - [ ] ViewExpired → nueva sesión + re-buscar + retomar página.
 - [ ] `npm test` verde offline; `npm run typecheck` limpio.

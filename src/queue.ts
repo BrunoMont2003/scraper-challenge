@@ -75,7 +75,7 @@ export class JobQueue {
 
   // ---------- pages ----------
 
-  /** True si la página ya fue procesada con éxito (para --resume). */
+  /** True si la página ya fue procesada con éxito (se salta al re-correr). */
   isPageDone(query: string, page: number): boolean {
     const row = this.db
       .prepare(`SELECT status FROM pages WHERE query=? AND page=?`)
@@ -162,43 +162,73 @@ export class JobQueue {
       .all() as DocRow[];
   }
 
+  /** Docs con metadata completa de una query (export por corrida). */
+  allDocsForQuery(query: string): DocRow[] {
+    return this.db
+      .prepare(`SELECT * FROM docs WHERE query=? AND detail_status='done' ORDER BY page, row_index`)
+      .all(query) as DocRow[];
+  }
+
   countDocs(): number {
     return (this.db.prepare(`SELECT COUNT(*) c FROM docs`).get() as { c: number }).c;
   }
 
-  countDetailDone(): number {
+  countDocsForQuery(query: string): number {
+    return (this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE query=?`).get(query) as { c: number }).c;
+  }
+
+  countDetailDoneForQuery(query: string): number {
     return (
-      this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE detail_status='done'`).get() as { c: number }
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM docs WHERE query=? AND detail_status='done'`)
+        .get(query) as { c: number }
     ).c;
   }
 
-  countFilePending(kind: "pdf" | "word"): number {
-    const col = kind === "pdf" ? "pdf_status" : "word_status";
+  countDetailFailedForQuery(query: string): number {
     return (
-      this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE ${col}='pending' OR ${col}='failed'`).get() as {
-        c: number;
-      }
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM docs WHERE query=? AND detail_status='failed'`)
+        .get(query) as { c: number }
     ).c;
   }
 
-  countFileDone(kind: "pdf" | "word"): number {
+  countFileDoneForQuery(kind: "pdf" | "word", query: string): number {
     const col = kind === "pdf" ? "pdf_status" : "word_status";
-    return (this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE ${col}='done'`).get() as { c: number }).c;
+    return (
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM docs WHERE query=? AND ${col}='done'`)
+        .get(query) as { c: number }
+    ).c;
   }
 
-  countFailed(): number {
+  countFailedForQuery(query: string): number {
     return (
       this.db
         .prepare(
-          `SELECT COUNT(*) c FROM docs WHERE detail_status='failed' OR pdf_status='failed' OR word_status='failed'`,
+          `SELECT COUNT(*) c FROM docs WHERE query=?
+           AND (detail_status='failed' OR pdf_status='failed' OR word_status='failed')`,
         )
-        .get() as { c: number }
+        .get(query) as { c: number }
     ).c;
   }
 
   /** Filas con metadata completa listas para escribir output. */
   rowsForOutput(): Array<{ row: DocRow; metadata: Record<string, unknown> }> {
     return this.allDocs().map((row) => {
+      let metadata: Record<string, unknown> = {};
+      try {
+        metadata = JSON.parse(row.metadata) as Record<string, unknown>;
+      } catch {
+        /* ignore */
+      }
+      return { row, metadata };
+    });
+  }
+
+  /** Filas con metadata completa de una query (export por corrida). */
+  rowsForOutputForQuery(query: string): Array<{ row: DocRow; metadata: Record<string, unknown> }> {
+    return this.allDocsForQuery(query).map((row) => {
       let metadata: Record<string, unknown> = {};
       try {
         metadata = JSON.parse(row.metadata) as Record<string, unknown>;
@@ -246,6 +276,17 @@ export class JobQueue {
          ORDER BY page, row_index`,
       )
       .all() as DocRow[];
+  }
+
+  /** Docs con cualquier estado failed de una query (para failed.jsonl). */
+  failedRowsForQuery(query: string): DocRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM docs WHERE query=?
+         AND (detail_status='failed' OR pdf_status='failed' OR word_status='failed')
+         ORDER BY page, row_index`,
+      )
+      .all(query) as DocRow[];
   }
 }
 

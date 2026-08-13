@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CliOptions, SearchFilters } from "./config";
 import { parseCli } from "./cli";
@@ -67,20 +67,25 @@ async function crawlPhase(ctx: Context): Promise<void> {
   const lastPage = opts.pages > 0 ? Math.min(pageData.lastPage, opts.pages) : pageData.lastPage;
 
   for (let page = 1; page <= lastPage; page++) {
-    if (opts.resume && ctx.queue.isPageDone(filters.query, page)) {
+    if (ctx.queue.isPageDone(filters.query, page)) {
+      ctx.stats.pagesDone++;
       continue;
     }
 
     // Página 1 viene de la búsqueda; las demás del paginador.
     let current = page === 1 ? pageData : await ctx.paginator.goToPage(filters, page);
     let recoveries = 0;
+    let pageFailed = false;
     ctx.queue.markPage(filters.query, page, "in_progress");
 
     for (let i = 0; i < current.cards.length; i++) {
       const card = current.cards[i]!;
       ctx.queue.insertCard(filters.query, page, card);
       const existing = ctx.queue.getDoc(card.uuid);
-      if (opts.resume && existing?.detail_status === "done") continue;
+      if (existing?.detail_status === "done") {
+        ctx.stats.detailDone++;
+        continue;
+      }
 
       try {
         const detail = await ctx.detailClient.fetchDetail(filters, page, card);
@@ -94,12 +99,13 @@ async function crawlPhase(ctx: Context): Promise<void> {
           continue;
         }
         ctx.queue.markDetail(card.uuid, "failed", errorMessage(err));
+        pageFailed = true;
         ctx.stats.detailFailed++;
         logger.warn(`detalle fallido ${card.nroexp}: ${errorMessage(err)}`);
       }
     }
 
-    ctx.queue.markPage(filters.query, page, "done");
+    ctx.queue.markPage(filters.query, page, pageFailed ? "failed" : "done");
     ctx.stats.pagesDone++;
     logger.progress(
       `pág ${page}/${lastPage} | docs ${ctx.stats.detailDone} | fallos ${ctx.stats.detailFailed}`,
@@ -108,11 +114,15 @@ async function crawlPhase(ctx: Context): Promise<void> {
   logger.progressEnd();
 }
 
-/** Fase 2: descargar PDF/Word pendientes con pool de concurrencia AIMD. */
+/** Fase 2: descargar PDF/Word pendientes con pool de concurrencia AIMD.
+ *  Los fallidos quedan marcados en la cola y se reintentan en la
+ *  siguiente corrida (idempotente), nunca abortan el resto. */
 async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
   let jobs = ctx.queue.pendingDownloads(kind);
   if (ctx.opts.maxFiles > 0) {
-    const doneTotal = ctx.queue.countFileDone("pdf") + ctx.queue.countFileDone("word");
+    const doneTotal =
+      ctx.queue.countFileDoneForQuery("pdf", ctx.filters.query) +
+      ctx.queue.countFileDoneForQuery("word", ctx.filters.query);
     const remaining = Math.max(0, ctx.opts.maxFiles - doneTotal);
     jobs = jobs.slice(0, remaining);
   }
@@ -174,7 +184,7 @@ async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
 
 /** Fase 3: export final JSONL/CSV + manifest de fallidos. */
 function exportPhase(ctx: Context): void {
-  const records = ctx.queue.rowsForOutput().map(({ row, metadata }) => {
+  const records = ctx.queue.rowsForOutputForQuery(ctx.filters.query).map(({ row, metadata }) => {
     const card = (metadata.card ?? {}) as Record<string, string>;
     const detail = (metadata.detail ?? {}) as Record<string, unknown>;
     return toFlatRecord({
@@ -196,24 +206,26 @@ function exportPhase(ctx: Context): void {
   ctx.output.writeJsonl(records);
   ctx.output.writeCsv(records);
 
-  const failed = ctx.queue.failedRows();
+  const failed = ctx.queue.failedRowsForQuery(ctx.filters.query);
+  const failedPath = join(ctx.opts.out, "failed.jsonl");
+  writeFileSync(
+    failedPath,
+    failed.length > 0
+      ? failed
+          .map((row) =>
+            JSON.stringify({
+              uuid: row.uuid,
+              page: row.page,
+              detail_status: row.detail_status,
+              pdf_status: row.pdf_status,
+              word_status: row.word_status,
+              last_error: row.last_error,
+            }),
+          )
+          .join("\n") + "\n"
+      : "",
+  );
   if (failed.length > 0) {
-    const failedPath = join(ctx.opts.out, "failed.jsonl");
-    appendFileSync(
-      failedPath,
-      failed
-        .map((row) =>
-          JSON.stringify({
-            uuid: row.uuid,
-            page: row.page,
-            detail_status: row.detail_status,
-            pdf_status: row.pdf_status,
-            word_status: row.word_status,
-            last_error: row.last_error,
-          }),
-        )
-        .join("\n") + "\n",
-    );
     ctx.logger.warn(`${failed.length} documentos con fallos → ${failedPath}`);
   }
 }
@@ -229,6 +241,12 @@ async function main(): Promise<void> {
     especialidad: opts.especialidad,
     anio: opts.anio,
   };
+
+  if (opts.fresh) {
+    const dbPath = defaultDbPath(opts.out);
+    rmSync(dbPath, { force: true });
+    logger.info(`--fresh: estado previo eliminado (${dbPath})`);
+  }
 
   const aimd = new AimdController({ initialConcurrency: opts.concurrency });
   const cookieHolder = { value: "" };
@@ -269,7 +287,12 @@ async function main(): Promise<void> {
     await downloadPhase(ctx, "pdf");
     await downloadPhase(ctx, "word");
     exportPhase(ctx);
-    ctx.stats.docsTotal = ctx.queue.countDocs();
+    ctx.stats.docsTotal = ctx.queue.countDocsForQuery(filters.query);
+    ctx.stats.detailDone = ctx.queue.countDetailDoneForQuery(filters.query);
+    ctx.stats.detailFailed = ctx.queue.countDetailFailedForQuery(filters.query);
+    ctx.stats.pdfsDone = ctx.queue.countFileDoneForQuery("pdf", filters.query);
+    ctx.stats.wordsDone = ctx.queue.countFileDoneForQuery("word", filters.query);
+    ctx.stats.filesFailed = ctx.queue.countFailedForQuery(filters.query);
     logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
   } catch (err) {
     logger.error(`Corrida abortada: ${errorMessage(err)}`);

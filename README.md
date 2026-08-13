@@ -27,8 +27,11 @@ npm run scrape -- --query "homicidio"
 # Todo el sitio: búsqueda vacía en Corte Suprema (~209K documentos)
 npm run scrape
 
-# Retomar una corrida interrumpida: salta lo que ya quedó hecho
-npm run scrape -- --query "homicidio" --resume
+# Re-correr es seguro: salta lo ya hecho y reintenta lo que falló
+npm run scrape -- --query "homicidio"
+
+# Empezar de cero (borra el estado y re-scrapea todo)
+npm run scrape -- --query "homicidio" --fresh
 ```
 
 ### Opciones
@@ -44,7 +47,7 @@ npm run scrape -- --query "homicidio" --resume
 | `--concurrency <N>` | `2` | Concurrencia inicial de descargas |
 | `--min-delay <ms>` | `500` | Delay mínimo entre requests |
 | `--out <dir>` | `data` | Directorio de salida |
-| `--resume` | off | Continuar una corrida anterior |
+| `--fresh` | off | Borra el estado y scrapea desde cero |
 | `--quiet` | off | Solo errores y resumen final |
 
 ## Salida
@@ -83,9 +86,9 @@ Dos detalles que ahorran horas: la sesión expira a mitad de corrida con `ViewEx
 
 ## Errores y rate limiting
 
-Los PDFs devuelven 429 con frecuencia. La descarga usa un control de concurrencia estilo TCP: si las cosas van bien sube de a uno, ante un 429 o error 5xx baja a la mitad. Cada request lleva retry con full-jitter backoff y respeta el header `Retry-After`. Los documentos que no logran completarse quedan en `failed.jsonl` y se reintentan con `--resume`; nunca se aborta la corrida completa por un documento.
+Los PDFs devuelven 429 con frecuencia. La descarga usa un control de concurrencia estilo TCP: si las cosas van bien sube de a uno, ante un 429 o error 5xx baja a la mitad. Cada request lleva retry con full-jitter backoff y respeta el header `Retry-After`. Los archivos que no logran completarse quedan marcados como fallidos y se reintentan en la siguiente corrida; nunca se aborta por un documento.
 
-Además hay un delay mínimo entre requests, dedupe por `uuid` (correr dos veces no duplica) y, si matas el proceso a la mitad, la cola se reacomoda sola al volver a abrirla.
+La cola es idempotente, así que correr dos veces no repite trabajo: hay delay mínimo entre requests, dedupe por `uuid`, y si matas el proceso a la mitad se retoma donde quedó al volver a abrir. Para borrar todo y empezar de cero, `--fresh`.
 
 ## Proyecto
 

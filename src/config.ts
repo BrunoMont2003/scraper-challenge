@@ -29,8 +29,8 @@ export interface CliOptions {
   minDelay: number;
   /** Directorio de salida. */
   out: string;
-  /** Retomar corrida anterior (saltar páginas/docs ya procesados). */
-  resume: boolean;
+  /** Borrar el estado previo (scraper.sqlite) y scrapear desde cero. */
+  fresh: boolean;
   /** Solo errores y resumen. */
   quiet: boolean;
 }
@@ -45,7 +45,7 @@ export const DEFAULT_OPTIONS: CliOptions = {
   concurrency: 2,
   minDelay: 500,
   out: "data",
-  resume: false,
+  fresh: false,
   quiet: false,
 };
 

@@ -70,6 +70,27 @@ describe("JobQueue (in-memory)", () => {
     expect(jobs[0]!.fileUuid).toBe("");
     q.close();
   });
+
+  it("counts por query no mezclan otras búsquedas", () => {
+    const q = new JobQueue(":memory:");
+    q.insertCard("penal", 1, makeCard("p-1", 0));
+    q.insertCard("penal", 1, makeCard("p-2", 1));
+    q.insertCard("homicidio", 1, makeCard("h-1", 0));
+    q.setDetail("p-1", { ...EMPTY_DETAIL, uuidPdf: "pdf-p1" });
+    q.setDetail("p-2", { ...EMPTY_DETAIL, uuidPdf: "pdf-p2" });
+    q.markFile("p-1", "pdf", "done", "x.pdf");
+    q.markFile("p-2", "pdf", "failed");
+
+    expect(q.countDocsForQuery("penal")).toBe(2);
+    expect(q.countDocsForQuery("homicidio")).toBe(1);
+    expect(q.countDetailDoneForQuery("penal")).toBe(2);
+    expect(q.countDetailDoneForQuery("homicidio")).toBe(0);
+    expect(q.countFileDoneForQuery("pdf", "penal")).toBe(1);
+    expect(q.countFailedForQuery("penal")).toBe(1);
+    expect(q.rowsForOutputForQuery("penal")).toHaveLength(2);
+    expect(q.failedRowsForQuery("penal")).toHaveLength(1);
+    q.close();
+  });
 });
 
 describe("SiteSession.isViewExpired", () => {

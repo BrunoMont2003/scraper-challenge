@@ -15,7 +15,7 @@ export function parseCli(argv: string[]): CliOptions {
     .description(
       "Scraper de Jurisprudencia Nacional del Poder Judicial del Perú.\n" +
         "Paginación completa + extracción de metadata (card + ficha 'Ver Ficha')\n" +
-        "+ descarga de PDF/Word, con rate limiting adaptativo (AIMD) y resume.",
+        "+ descarga de PDF/Word, con rate limiting adaptativo (AIMD) y cola idempotente.",
     )
     .option("--query <texto>", "texto de búsqueda (vacío = búsqueda completa)", DEFAULT_OPTIONS.query)
     .option("--corte <1|2>", "corte: 1=Suprema, 2=Superior", DEFAULT_OPTIONS.corte)
@@ -42,7 +42,7 @@ export function parseCli(argv: string[]): CliOptions {
       String(DEFAULT_OPTIONS.minDelay),
     )
     .option("--out <dir>", "directorio de salida", DEFAULT_OPTIONS.out)
-    .option("--resume", "retomar corrida anterior (saltar páginas/docs ya procesados)")
+    .option("--fresh", "borrar el estado previo y scrapear desde cero (por defecto se retoma)")
     .option("--quiet", "solo errores y resumen final")
     .showHelpAfterError()
     .parse(argv);
@@ -59,7 +59,7 @@ export function parseCli(argv: string[]): CliOptions {
     concurrency: Math.max(1, int(opts.concurrency ?? "2", "concurrency")),
     minDelay: int(opts.minDelay ?? "500", "min-delay"),
     out: opts.out ?? DEFAULT_OPTIONS.out,
-    resume: Boolean(opts.resume),
+    fresh: Boolean(opts.fresh),
     quiet: Boolean(opts.quiet),
   };
 }

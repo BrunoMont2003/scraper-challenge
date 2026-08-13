@@ -11,7 +11,7 @@ describe("parseCli", () => {
     expect(opts.concurrency).toBe(2);
     expect(opts.minDelay).toBe(500);
     expect(opts.out).toBe("data");
-    expect(opts.resume).toBe(false);
+    expect(opts.fresh).toBe(false);
   });
 
   it("parsea flags kebab-case (commander los camelCasea)", () => {
@@ -26,13 +26,13 @@ describe("parseCli", () => {
       "25",
       "--min-delay",
       "800",
-      "--resume",
+      "--fresh",
     ]);
     expect(opts.query).toBe("homicidio");
     expect(opts.pages).toBe(3);
     expect(opts.maxFiles).toBe(25);
     expect(opts.minDelay).toBe(800);
-    expect(opts.resume).toBe(true);
+    expect(opts.fresh).toBe(true);
   });
 
   it("valida enteros no negativos", () => {
