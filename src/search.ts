@@ -1,8 +1,7 @@
-import { SITE, buildSearchFormValues, type SearchFilters } from "./config";
+import { buildSearchFormValues, type SearchFilters, SITE } from "./config";
 import type { HttpClient } from "./http/client";
-import { SiteSession } from "./http/session";
-import { extractViewState } from "./http/session";
-import { parseResultsPage, type ParsedResultsPage } from "./parser";
+import { extractViewState, SiteSession } from "./http/session";
+import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
  * Flujo de búsqueda (docs/spec.md §2):

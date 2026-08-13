@@ -1,8 +1,7 @@
-import { SITE, buildPaginationFormValues, type SearchFilters } from "./config";
+import { buildPaginationFormValues, type SearchFilters, SITE } from "./config";
 import type { HttpClient } from "./http/client";
-import { SiteSession } from "./http/session";
-import { extractViewState } from "./http/session";
-import { parseResultsPage, type ParsedResultsPage } from "./parser";
+import { extractViewState, SiteSession } from "./http/session";
+import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
  * Paginación (docs/spec.md §4): POST resultado.xhtml con spinner=N +

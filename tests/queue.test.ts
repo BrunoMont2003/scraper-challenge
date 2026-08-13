@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { JobQueue } from "../src/queue";
-import { EMPTY_DETAIL, type CardRecord } from "../src/config";
+import { type CardRecord, EMPTY_DETAIL } from "../src/config";
 import { SiteSession } from "../src/http/session";
+import { JobQueue } from "../src/queue";
 
 function makeCard(uuid: string, rowIndex = 0): CardRecord {
   return {
@@ -24,7 +24,7 @@ describe("JobQueue (in-memory)", () => {
     const q = new JobQueue(":memory:");
     expect(q.insertCard("penal", 1, makeCard("uuid-1"))).toBe(true);
     expect(q.insertCard("penal", 2, makeCard("uuid-1"))).toBe(false);
-    expect(q.countDocs()).toBe(1);
+    expect(q.countDocsForQuery("penal")).toBe(1);
     q.close();
   });
 
@@ -97,7 +97,7 @@ describe("SiteSession.isViewExpired", () => {
   it("detecta ViewExpiredException en body", () => {
     expect(
       SiteSession.isViewExpired(
-        '<partial-response><error><error-name>class javax.faces.application.ViewExpiredException</error-name></error></partial-response>',
+        "<partial-response><error><error-name>class javax.faces.application.ViewExpiredException</error-name></error></partial-response>",
       ),
     ).toBe(true);
   });

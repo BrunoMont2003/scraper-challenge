@@ -1,11 +1,11 @@
 import axios from "axios";
 import { USER_AGENT } from "../config";
 import {
-  AimdController,
+  type AimdController,
+  type BackoffOptions,
   DEFAULT_BACKOFF,
   jitteredBackoff,
   parseRetryAfter,
-  type BackoffOptions,
   type RateSignal,
 } from "../ratelimit";
 
@@ -24,7 +24,6 @@ export interface ClientOptions {
 }
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
-const RETRYABLE_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 const DEFAULT_TIMEOUT = 30_000;
 
@@ -89,10 +88,7 @@ export class HttpClient {
       for (const [k, v] of Object.entries(res.headers)) {
         headers[k] = String(v);
       }
-      const body =
-        responseType === "arraybuffer"
-          ? Buffer.from(res.data)
-          : String(res.data ?? "");
+      const body = responseType === "arraybuffer" ? Buffer.from(res.data) : String(res.data ?? "");
       return { status: res.status, headers, data: body };
     } catch (err) {
       throw new NetworkError(err);
@@ -138,7 +134,8 @@ export class HttpClient {
 
   /**
    * Request siguiendo redirects manualmente (máx 10 hops).
-   * Tras un 301/302/303 el siguiente hop es GET (comportamiento de browser).
+   * Tras un 301/302/303 el siguiente hop es GET (comportamiento de browser);
+   * un 307/308 preserva método y body.
    */
   async requestWithRedirects(
     method: "GET" | "POST",
@@ -153,9 +150,12 @@ export class HttpClient {
       const res = await this.request(currentMethod, currentUrl, currentData, responseType);
       const location = res.headers["location"];
       if (REDIRECT_CODES.has(res.status) && location) {
+        const preserveBody = res.status === 307 || res.status === 308;
         currentUrl = new URL(rewriteToHttps(location), currentUrl).toString();
-        currentMethod = "GET";
-        currentData = undefined;
+        if (!preserveBody) {
+          currentMethod = "GET";
+          currentData = undefined;
+        }
         continue;
       }
       return { result: res, finalUrl: currentUrl };
@@ -187,17 +187,9 @@ export function rewriteToHttps(url: string): string {
   return url.replace(/^http:\/\//i, "https://");
 }
 
-export function isRetryableStatus(status: number): boolean {
-  return RETRYABLE_CODES.has(status);
-}
-
 export class NetworkError extends Error {
   constructor(public override readonly cause: unknown) {
-    super(
-      axios.isAxiosError(cause) && cause.code === "ETIMEDOUT"
-        ? "timeout"
-        : "network error",
-    );
+    super(axios.isAxiosError(cause) && cause.code === "ETIMEDOUT" ? "timeout" : "network error");
     this.name = "NetworkError";
   }
 }

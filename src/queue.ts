@@ -1,6 +1,6 @@
-import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
+import Database from "better-sqlite3";
 import type { CardRecord, DetailRecord } from "./config";
 
 export type Status = "pending" | "in_progress" | "done" | "failed" | "missing";
@@ -123,15 +123,25 @@ export class JobQueue {
 
   markDetail(uuid: string, status: Status, error?: string): void {
     this.db
-      .prepare(`UPDATE docs SET detail_status=?, last_error=?, updated_at=datetime('now') WHERE uuid=?`)
+      .prepare(
+        `UPDATE docs SET detail_status=?, last_error=?, updated_at=datetime('now') WHERE uuid=?`,
+      )
       .run(status, error ?? null, uuid);
   }
 
-  markFile(uuid: string, kind: "pdf" | "word", status: Status, path?: string, error?: string): void {
+  markFile(
+    uuid: string,
+    kind: "pdf" | "word",
+    status: Status,
+    path?: string,
+    error?: string,
+  ): void {
     const col = kind === "pdf" ? "pdf_status" : "word_status";
     const pathCol = kind === "pdf" ? "pdf_path" : "word_path";
     this.db
-      .prepare(`UPDATE docs SET ${col}=?, ${pathCol}=?, last_error=?, updated_at=datetime('now') WHERE uuid=?`)
+      .prepare(
+        `UPDATE docs SET ${col}=?, ${pathCol}=?, last_error=?, updated_at=datetime('now') WHERE uuid=?`,
+      )
       .run(status, path ?? null, error ?? null, uuid);
   }
 
@@ -155,13 +165,6 @@ export class JobQueue {
     return this.db.prepare(`SELECT * FROM docs WHERE uuid=?`).get(uuid) as DocRow | undefined;
   }
 
-  /** Todos los docs con metadata completa (para export JSONL/CSV). */
-  allDocs(): DocRow[] {
-    return this.db
-      .prepare(`SELECT * FROM docs WHERE detail_status='done' ORDER BY page, row_index`)
-      .all() as DocRow[];
-  }
-
   /** Docs con metadata completa de una query (export por corrida). */
   allDocsForQuery(query: string): DocRow[] {
     return this.db
@@ -174,7 +177,29 @@ export class JobQueue {
   }
 
   countDocsForQuery(query: string): number {
-    return (this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE query=?`).get(query) as { c: number }).c;
+    return (
+      this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE query=?`).get(query) as { c: number }
+    ).c;
+  }
+
+  countPagesDoneForQuery(query: string): number {
+    return (
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM pages WHERE query=? AND status='done'`)
+        .get(query) as {
+        c: number;
+      }
+    ).c;
+  }
+
+  countFailedPagesForQuery(query: string): number {
+    return (
+      this.db
+        .prepare(`SELECT COUNT(*) c FROM pages WHERE query=? AND status='failed'`)
+        .get(query) as {
+        c: number;
+      }
+    ).c;
   }
 
   countDetailDoneForQuery(query: string): number {
@@ -196,9 +221,9 @@ export class JobQueue {
   countFileDoneForQuery(kind: "pdf" | "word", query: string): number {
     const col = kind === "pdf" ? "pdf_status" : "word_status";
     return (
-      this.db
-        .prepare(`SELECT COUNT(*) c FROM docs WHERE query=? AND ${col}='done'`)
-        .get(query) as { c: number }
+      this.db.prepare(`SELECT COUNT(*) c FROM docs WHERE query=? AND ${col}='done'`).get(query) as {
+        c: number;
+      }
     ).c;
   }
 
@@ -211,19 +236,6 @@ export class JobQueue {
         )
         .get(query) as { c: number }
     ).c;
-  }
-
-  /** Filas con metadata completa listas para escribir output. */
-  rowsForOutput(): Array<{ row: DocRow; metadata: Record<string, unknown> }> {
-    return this.allDocs().map((row) => {
-      let metadata: Record<string, unknown> = {};
-      try {
-        metadata = JSON.parse(row.metadata) as Record<string, unknown>;
-      } catch {
-        /* ignore */
-      }
-      return { row, metadata };
-    });
   }
 
   /** Filas con metadata completa de una query (export por corrida). */
@@ -239,19 +251,23 @@ export class JobQueue {
     });
   }
 
-  /** Docs con detalle listo y archivo pendiente/fallido (para descarga). */
+  /** Docs con detalle listo y archivo pendiente/fallido (para descarga).
+   *  Ordena primero los nunca intentados; los reintentos van al final. */
   pendingDownloads(kind: "pdf" | "word"): Array<{
     docUuid: string;
     fileUuid: string;
     nroexp: string;
+    attempts: number;
   }> {
     const col = kind === "pdf" ? "pdf_status" : "word_status";
     const rows = this.db
       .prepare(
-        `SELECT uuid, metadata FROM docs WHERE detail_status='done' AND (${col}='pending' OR ${col}='failed')`,
+        `SELECT uuid, metadata, attempts FROM docs
+         WHERE detail_status='done' AND (${col}='pending' OR ${col}='failed')
+         ORDER BY attempts ASC`,
       )
-      .all() as Array<{ uuid: string; metadata: string }>;
-    const out: Array<{ docUuid: string; fileUuid: string; nroexp: string }> = [];
+      .all() as Array<{ uuid: string; metadata: string; attempts: number }>;
+    const out: Array<{ docUuid: string; fileUuid: string; nroexp: string; attempts: number }> = [];
     for (const row of rows) {
       let metadata: Record<string, unknown> = {};
       try {
@@ -263,19 +279,9 @@ export class JobQueue {
       const fileUuid = String(detail[kind === "pdf" ? "uuidPdf" : "uuidWord"] ?? "");
       const card = (metadata.card ?? {}) as Record<string, unknown>;
       const nroexp = String(card.nroexp ?? "");
-      out.push({ docUuid: row.uuid, fileUuid, nroexp });
+      out.push({ docUuid: row.uuid, fileUuid, nroexp, attempts: row.attempts });
     }
     return out;
-  }
-
-  /** Docs con cualquier estado failed (para failed.jsonl). */
-  failedRows(): DocRow[] {
-    return this.db
-      .prepare(
-        `SELECT * FROM docs WHERE detail_status='failed' OR pdf_status='failed' OR word_status='failed'
-         ORDER BY page, row_index`,
-      )
-      .all() as DocRow[];
   }
 
   /** Docs con cualquier estado failed de una query (para failed.jsonl). */

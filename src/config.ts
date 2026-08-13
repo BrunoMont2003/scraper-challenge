@@ -25,6 +25,8 @@ export interface CliOptions {
   maxFiles: number;
   /** Concurrencia inicial de descargas. */
   concurrency: number;
+  /** Sesiones de navegación paralelas (cada una con su propia JSESSIONID). */
+  sessions: number;
   /** Delay mínimo entre requests (ms). */
   minDelay: number;
   /** Directorio de salida. */
@@ -43,6 +45,7 @@ export const DEFAULT_OPTIONS: CliOptions = {
   pages: 0,
   maxFiles: 0,
   concurrency: 2,
+  sessions: 1,
   minDelay: 500,
   out: "data",
   fresh: false,

@@ -1,16 +1,15 @@
 import { load } from "cheerio";
 import type { AnyNode } from "domhandler";
 import {
-  SITE,
-  EMPTY_DETAIL,
   buildDetailFormValues,
   type CardRecord,
   type DetailRecord,
+  EMPTY_DETAIL,
   type SearchFilters,
+  SITE,
 } from "./config";
 import type { HttpClient } from "./http/client";
-import { SiteSession } from "./http/session";
-import { extractViewState } from "./http/session";
+import { extractViewState, SiteSession } from "./http/session";
 
 const AJAX_HEADERS = {
   "Faces-Request": "partial/ajax",

@@ -7,6 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.tests.json",
     "scrape": "tsx src/index.ts",
+    "lint": "biome check src tests",
+    "lint:fix": "biome check --write src tests",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -23,6 +25,7 @@
     "url": "https://github.com/BrunoMont2003/scraper-challenge.git"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.8",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.2.0",
     "tsx": "^4.23.12",
@@ -34,7 +37,6 @@
     "better-sqlite3": "^12.6.2",
     "cheerio": "^1.2.0",
     "commander": "^14.0.2",
-    "domhandler": "^6.0.1",
-    "p-limit": "^7.2.0"
+    "domhandler": "^6.0.1"
   }
 }

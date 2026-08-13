@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  AdaptiveSemaphore,
   AimdController,
+  crossRunDelay,
   DEFAULT_BACKOFF,
   jitteredBackoff,
   parseRetryAfter,
@@ -60,7 +62,12 @@ describe("AimdController", () => {
   });
 
   it("additive increase: sube de a 1 tras rampUpAfter éxitos", () => {
-    const c = new AimdController({ initialConcurrency: 1, maxConcurrency: 4, rampUpAfter: 5, cooldownMs: 0 });
+    const c = new AimdController({
+      initialConcurrency: 1,
+      maxConcurrency: 4,
+      rampUpAfter: 5,
+      cooldownMs: 0,
+    });
     for (let i = 0; i < 5; i++) c.report("success");
     expect(c.concurrency).toBe(2);
     for (let i = 0; i < 5; i++) c.report("success");
@@ -68,7 +75,12 @@ describe("AimdController", () => {
   });
 
   it("no supera maxConcurrency", () => {
-    const c = new AimdController({ initialConcurrency: 1, maxConcurrency: 2, rampUpAfter: 1, cooldownMs: 0 });
+    const c = new AimdController({
+      initialConcurrency: 1,
+      maxConcurrency: 2,
+      rampUpAfter: 1,
+      cooldownMs: 0,
+    });
     for (let i = 0; i < 20; i++) c.report("success");
     expect(c.concurrency).toBe(2);
   });
@@ -85,5 +97,52 @@ describe("AimdController", () => {
     expect(c.concurrency).toBe(2);
     c.report("success");
     expect(c.concurrency).toBe(2); // aún en cooldown
+  });
+});
+
+describe("crossRunDelay", () => {
+  it("espacia exponencialmente y hace cap a 60s", () => {
+    expect(crossRunDelay(1)).toBe(1_000);
+    expect(crossRunDelay(2)).toBe(2_000);
+    expect(crossRunDelay(6)).toBeLessThanOrEqual(60_000);
+    expect(crossRunDelay(100)).toBe(60_000);
+  });
+});
+
+describe("AdaptiveSemaphore", () => {
+  it("respeta el límite concurrente", async () => {
+    const sem = new AdaptiveSemaphore(() => 2);
+    let active = 0;
+    let peak = 0;
+    const task = async (): Promise<void> => {
+      await sem.acquire();
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 10));
+      active--;
+      sem.release();
+    };
+    await Promise.all(Array.from({ length: 8 }, task));
+    expect(peak).toBe(2);
+  });
+
+  it("sigue el límite dinámico (AIMD sube la capacidad)", async () => {
+    let limit = 1;
+    const sem = new AdaptiveSemaphore(() => limit);
+    let active = 0;
+    let peak = 0;
+    const task = async (): Promise<void> => {
+      await sem.acquire();
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 10));
+      active--;
+      sem.release();
+    };
+    const running = Promise.all(Array.from({ length: 8 }, task));
+    await new Promise((r) => setTimeout(r, 15));
+    limit = 3;
+    await running;
+    expect(peak).toBeGreaterThan(1);
   });
 });

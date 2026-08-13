@@ -1,5 +1,4 @@
-import { writeFileSync } from "node:fs";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SITE } from "./config";
 import type { HttpClient } from "./http/client";
@@ -23,7 +22,7 @@ export class Downloader {
 
   constructor(
     private readonly http: HttpClient,
-    private readonly outDir: string,
+    outDir: string,
   ) {
     this.pdfDir = join(outDir, "pdfs");
     this.wordDir = join(outDir, "words");
@@ -37,10 +36,23 @@ export class Downloader {
 
     const contentType = (res.headers["content-type"] ?? "").toLowerCase();
     if (res.status !== 200 || contentType.includes("text/html")) {
-      return { ok: false, missing: res.status === 404, error: `HTTP ${res.status} (${contentType})` };
+      return {
+        ok: false,
+        missing: res.status === 404,
+        error: `HTTP ${res.status} (${contentType})`,
+      };
     }
     if (!Buffer.isBuffer(res.data) || res.data.length < 1000) {
-      return { ok: false, error: `respuesta inválida (${Buffer.isBuffer(res.data) ? res.data.length : 0} bytes)` };
+      return {
+        ok: false,
+        error: `respuesta inválida (${Buffer.isBuffer(res.data) ? res.data.length : 0} bytes)`,
+      };
+    }
+    if (!hasMagicBytes(res.data, kind)) {
+      return {
+        ok: false,
+        error: `el contenido no parece un ${kind.toUpperCase()} (magic bytes inválidos)`,
+      };
     }
 
     const ext = inferExtension(res.headers["content-disposition"] ?? "", kind);
@@ -57,6 +69,14 @@ function inferExtension(contentDisposition: string, kind: FileKind): string {
   const match = /filename="?[^"\\]*\.([a-z0-9]+)"?/i.exec(contentDisposition);
   if (match) return match[1]!.toLowerCase();
   return kind === "pdf" ? "pdf" : "doc";
+}
+
+/** Verifica las cabeceras binarias: PDF `%PDF-`, Word OLE2 `D0CF11E0`. */
+function hasMagicBytes(buf: Buffer, kind: FileKind): boolean {
+  if (kind === "pdf") {
+    return buf.subarray(0, 5).toString("latin1") === "%PDF-";
+  }
+  return buf.length >= 8 && buf.readUInt32LE(0) === 0xe011cfd0;
 }
 
 function sanitizeName(name: string): string {

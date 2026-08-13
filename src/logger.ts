@@ -29,7 +29,13 @@ export class Logger {
     if (this.silent && level !== "error") return;
     const ts = new Date().toISOString().slice(11, 19);
     const tag =
-      level === "error" ? "ERROR" : level === "warn" ? "WARN " : level === "success" ? "OK   " : "INFO ";
+      level === "error"
+        ? "ERROR"
+        : level === "warn"
+          ? "WARN "
+          : level === "success"
+            ? "OK   "
+            : "INFO ";
     process.stdout.write(`[${ts}] [${tag}] [${this.prefix}] ${message}\n`);
   }
 

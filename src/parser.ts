@@ -112,9 +112,7 @@ export function extractAjaxParams(onclick: string): Record<string, string> {
 /** Decodifica escapes JS dentro de strings de parámetros (\\u002D → -, \\/ → /). */
 function decodeJsString(value: string): string {
   return value
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
-      String.fromCharCode(parseInt(hex, 16)),
-    )
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/\\\//g, "/")
     .replace(/\\"/g, '"')
     .replace(/\\\\/g, "\\");

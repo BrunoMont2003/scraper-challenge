@@ -1,17 +1,14 @@
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { CliOptions, SearchFilters } from "./config";
 import { parseCli } from "./cli";
-import { DetailClient } from "./detail";
+import type { CliOptions, SearchFilters } from "./config";
 import { Downloader, type FileKind } from "./download";
 import { HttpClient } from "./http/client";
-import { SiteSession } from "./http/session";
 import { Logger, type RunStats } from "./logger";
 import { OutputWriter, toFlatRecord } from "./output";
-import { Paginator } from "./paginate";
-import { JobQueue, defaultDbPath } from "./queue";
-import { AimdController } from "./ratelimit";
-import { SearchClient } from "./search";
+import { defaultDbPath, JobQueue } from "./queue";
+import { AdaptiveSemaphore, AimdController, crossRunDelay } from "./ratelimit";
+import { SessionWorker } from "./session-worker";
 
 const MAX_RECOVERIES_PER_PAGE = 3;
 
@@ -32,29 +29,79 @@ interface Context {
   filters: SearchFilters;
   logger: Logger;
   aimd: AimdController;
-  session: SiteSession;
   queue: JobQueue;
-  searchClient: SearchClient;
-  paginator: Paginator;
-  detailClient: DetailClient;
+  workers: SessionWorker[];
   downloader: Downloader;
   output: OutputWriter;
   stats: RunStats;
 }
 
-async function recoverToPage(ctx: Context, page: number) {
-  ctx.logger.warn("Sesión/ViewState expirado — nueva sesión y re-búsqueda...");
-  await ctx.session.login();
-  await ctx.searchClient.search(ctx.filters);
-  return ctx.paginator.goToPage(ctx.filters, page);
+/** Procesa las páginas asignadas a una sesión (paginar + ficha de cada card). */
+async function crawlPagesWithWorker(
+  ctx: Context,
+  worker: SessionWorker,
+  pages: number[],
+): Promise<void> {
+  const { filters, logger, queue, stats } = ctx;
+  if (pages.length === 0) return;
+
+  let current = await worker.ensureSearched(filters);
+
+  for (const page of pages) {
+    if (queue.isPageDone(filters.query, page)) {
+      stats.pagesDone++;
+      continue;
+    }
+    queue.markPage(filters.query, page, "in_progress");
+    current = await worker.page(filters, page);
+
+    let recoveries = 0;
+    let pageFailed = false;
+
+    for (let i = 0; i < current.cards.length; i++) {
+      const card = current.cards[i]!;
+      queue.insertCard(filters.query, page, card);
+      const existing = queue.getDoc(card.uuid);
+      if (existing?.detail_status === "done") {
+        stats.detailDone++;
+        continue;
+      }
+
+      try {
+        const detail = await worker.detailClient.fetchDetail(filters, page, card);
+        queue.setDetail(card.uuid, detail);
+        stats.detailDone++;
+      } catch (err) {
+        if (isViewExpired(err) && recoveries < MAX_RECOVERIES_PER_PAGE) {
+          recoveries++;
+          await worker.recover(filters);
+          current = await worker.page(filters, page);
+          i--;
+          continue;
+        }
+        queue.markDetail(card.uuid, "failed", errorMessage(err));
+        pageFailed = true;
+        stats.detailFailed++;
+        logger.warn(`detalle fallido ${card.nroexp}: ${errorMessage(err)}`);
+      }
+    }
+
+    queue.markPage(filters.query, page, pageFailed ? "failed" : "done");
+    stats.pagesDone++;
+    logger.progress(`pág ${page} | docs ${stats.detailDone} | fallos ${stats.detailFailed}`);
+  }
 }
 
-/** Fase 1: paginar + extraer card + ficha detallada de cada documento. */
+/**
+ * Fase 1: reparte las páginas entre las N sesiones y extrae card + ficha.
+ * Cada sesión paginación e ViewState propios → paralelo sin pisarse.
+ */
 async function crawlPhase(ctx: Context): Promise<void> {
-  const { opts, filters, logger } = ctx;
+  const { opts, filters, logger, workers } = ctx;
 
+  const primary = workers[0]!;
   logger.info(`Búsqueda: "${filters.query}" (corte=${filters.corte})`);
-  const pageData = await ctx.searchClient.search(filters);
+  const pageData = await primary.ensureSearched(filters);
   if (pageData.lastPage === 0 || pageData.cards.length === 0) {
     throw new Error(
       "La búsqueda no devolvió resultados (¿formulario incompleto? Ver docs/spec.md §2)",
@@ -66,52 +113,12 @@ async function crawlPhase(ctx: Context): Promise<void> {
 
   const lastPage = opts.pages > 0 ? Math.min(pageData.lastPage, opts.pages) : pageData.lastPage;
 
+  const assignments: number[][] = workers.map(() => []);
   for (let page = 1; page <= lastPage; page++) {
-    if (ctx.queue.isPageDone(filters.query, page)) {
-      ctx.stats.pagesDone++;
-      continue;
-    }
-
-    // Página 1 viene de la búsqueda; las demás del paginador.
-    let current = page === 1 ? pageData : await ctx.paginator.goToPage(filters, page);
-    let recoveries = 0;
-    let pageFailed = false;
-    ctx.queue.markPage(filters.query, page, "in_progress");
-
-    for (let i = 0; i < current.cards.length; i++) {
-      const card = current.cards[i]!;
-      ctx.queue.insertCard(filters.query, page, card);
-      const existing = ctx.queue.getDoc(card.uuid);
-      if (existing?.detail_status === "done") {
-        ctx.stats.detailDone++;
-        continue;
-      }
-
-      try {
-        const detail = await ctx.detailClient.fetchDetail(filters, page, card);
-        ctx.queue.setDetail(card.uuid, detail);
-        ctx.stats.detailDone++;
-      } catch (err) {
-        if (isViewExpired(err) && recoveries < MAX_RECOVERIES_PER_PAGE) {
-          recoveries++;
-          current = await recoverToPage(ctx, page);
-          i--; // reintentar esta fila con la página re-cargada
-          continue;
-        }
-        ctx.queue.markDetail(card.uuid, "failed", errorMessage(err));
-        pageFailed = true;
-        ctx.stats.detailFailed++;
-        logger.warn(`detalle fallido ${card.nroexp}: ${errorMessage(err)}`);
-      }
-    }
-
-    ctx.queue.markPage(filters.query, page, pageFailed ? "failed" : "done");
-    ctx.stats.pagesDone++;
-    logger.progress(
-      `pág ${page}/${lastPage} | docs ${ctx.stats.detailDone} | fallos ${ctx.stats.detailFailed}`,
-    );
+    assignments[(page - 1) % workers.length]!.push(page);
   }
-  logger.progressEnd();
+
+  await Promise.all(workers.map((worker, i) => crawlPagesWithWorker(ctx, worker, assignments[i]!)));
 }
 
 /** Fase 2: descargar PDF/Word pendientes con pool de concurrencia AIMD.
@@ -120,41 +127,31 @@ async function crawlPhase(ctx: Context): Promise<void> {
 async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
   let jobs = ctx.queue.pendingDownloads(kind);
   if (ctx.opts.maxFiles > 0) {
-    const doneTotal =
-      ctx.queue.countFileDoneForQuery("pdf", ctx.filters.query) +
-      ctx.queue.countFileDoneForQuery("word", ctx.filters.query);
-    const remaining = Math.max(0, ctx.opts.maxFiles - doneTotal);
-    jobs = jobs.slice(0, remaining);
+    const done = ctx.queue.countFileDoneForQuery(kind, ctx.filters.query);
+    jobs = jobs.slice(0, Math.max(0, ctx.opts.maxFiles - done));
   }
   if (jobs.length === 0) return;
 
   ctx.logger.info(`Descargando ${jobs.length} archivos ${kind.toUpperCase()}...`);
 
+  const sem = new AdaptiveSemaphore(() => ctx.aimd.concurrency);
   let idx = 0;
-  let active = 0;
-  const workerCount = Math.min(ctx.aimd.concurrency, jobs.length);
-
-  const gate = async (): Promise<void> => {
-    while (active >= ctx.aimd.concurrency) await sleep(200);
-    active++;
-  };
-  const release = (): void => {
-    active--;
-  };
 
   const worker = async (): Promise<void> => {
     for (;;) {
-      await gate();
+      await sem.acquire();
       const job = jobs[idx];
       if (!job) {
-        release();
+        sem.release();
         break;
       }
       idx += 1;
+
+      if (job.attempts > 0) await sleep(crossRunDelay(job.attempts));
+
       try {
         if (!job.fileUuid) {
           ctx.queue.markFile(job.docUuid, kind, "missing");
-          release();
           continue;
         }
         const outcome = await ctx.downloader.download(job.fileUuid, kind, job.nroexp);
@@ -165,21 +162,23 @@ async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
         } else if (outcome.missing) {
           ctx.queue.markFile(job.docUuid, kind, "missing");
         } else {
+          ctx.queue.incrementAttempts(job.docUuid);
           ctx.queue.markFile(job.docUuid, kind, "failed", undefined, outcome.error);
           ctx.stats.filesFailed++;
           ctx.logger.warn(`${kind} fallido ${job.nroexp}: ${outcome.error}`);
         }
       } catch (err) {
+        ctx.queue.incrementAttempts(job.docUuid);
         ctx.queue.markFile(job.docUuid, kind, "failed", undefined, errorMessage(err));
         ctx.stats.filesFailed++;
         ctx.logger.warn(`${kind} fallido ${job.nroexp}: ${errorMessage(err)}`);
       } finally {
-        release();
+        sem.release();
       }
     }
   };
 
-  await Promise.all(Array.from({ length: workerCount }, worker));
+  await Promise.all(Array.from({ length: Math.min(ctx.aimd.maxConcurrency, jobs.length) }, worker));
 }
 
 /** Fase 3: export final JSONL/CSV + manifest de fallidos. */
@@ -202,7 +201,9 @@ function exportPhase(ctx: Context): void {
     });
   });
 
-  ctx.logger.info(`Escribiendo ${records.length} registros a ${ctx.output.jsonlPath} y ${ctx.output.csvPath}`);
+  ctx.logger.info(
+    `Escribiendo ${records.length} registros a ${ctx.output.jsonlPath} y ${ctx.output.csvPath}`,
+  );
   ctx.output.writeJsonl(records);
   ctx.output.writeCsv(records);
 
@@ -249,25 +250,20 @@ async function main(): Promise<void> {
   }
 
   const aimd = new AimdController({ initialConcurrency: opts.concurrency });
-  const cookieHolder = { value: "" };
-  const http = new HttpClient({
-    cookie: () => cookieHolder.value,
-    minDelayMs: opts.minDelay,
-    aimd,
-  });
-  const session = new SiteSession(http, cookieHolder);
+  const workers = Array.from(
+    { length: opts.sessions },
+    () => new SessionWorker({ minDelayMs: opts.minDelay }),
+  );
+  const downloadHttp = new HttpClient({ cookie: () => "", minDelayMs: opts.minDelay, aimd });
 
   const ctx: Context = {
     opts,
     filters,
     logger,
     aimd,
-    session,
     queue: new JobQueue(defaultDbPath(opts.out)),
-    searchClient: new SearchClient(http, session),
-    paginator: new Paginator(http, session),
-    detailClient: new DetailClient(http, session),
-    downloader: new Downloader(http, opts.out),
+    workers,
+    downloader: new Downloader(downloadHttp, opts.out),
     output: new OutputWriter(opts.out),
     stats: {
       pagesDone: 0,
@@ -282,23 +278,50 @@ async function main(): Promise<void> {
     },
   };
 
+  let queueClosed = false;
+  const closeQueue = (): void => {
+    if (!queueClosed) {
+      queueClosed = true;
+      ctx.queue.close();
+    }
+  };
+
+  // Ctrl+C: resumen parcial + estado ya persistido (la cola hace resume).
+  const onSigint = (): void => {
+    logger.warn("Interrupción (Ctrl+C) — el estado queda guardado; reintenta al volver a correr");
+    try {
+      ctx.stats.docsTotal = ctx.queue.countDocsForQuery(filters.query);
+      logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
+    } catch {
+      /* la DB puede estar a media escritura */
+    }
+    closeQueue();
+    process.exit(130);
+  };
+  process.on("SIGINT", onSigint);
+
   try {
     await crawlPhase(ctx);
     await downloadPhase(ctx, "pdf");
     await downloadPhase(ctx, "word");
     exportPhase(ctx);
+
+    // Recomputar desde la cola: fuente de verdad, no contadores volátiles.
     ctx.stats.docsTotal = ctx.queue.countDocsForQuery(filters.query);
     ctx.stats.detailDone = ctx.queue.countDetailDoneForQuery(filters.query);
     ctx.stats.detailFailed = ctx.queue.countDetailFailedForQuery(filters.query);
     ctx.stats.pdfsDone = ctx.queue.countFileDoneForQuery("pdf", filters.query);
     ctx.stats.wordsDone = ctx.queue.countFileDoneForQuery("word", filters.query);
     ctx.stats.filesFailed = ctx.queue.countFailedForQuery(filters.query);
+    ctx.stats.pagesDone = ctx.queue.countPagesDoneForQuery(filters.query);
+    ctx.stats.pagesFailed = ctx.queue.countFailedPagesForQuery(filters.query);
     logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
   } catch (err) {
     logger.error(`Corrida abortada: ${errorMessage(err)}`);
     process.exitCode = 1;
   } finally {
-    ctx.queue.close();
+    closeQueue();
+    process.off("SIGINT", onSigint);
   }
 }
 

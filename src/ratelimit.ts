@@ -41,7 +41,10 @@ export const DEFAULT_BACKOFF: BackoffOptions = {
 };
 
 /** Parse del header Retry-After: segundos o fecha HTTP (RFC 7231). */
-export function parseRetryAfter(value: string | undefined, now: number = Date.now()): number | null {
+export function parseRetryAfter(
+  value: string | undefined,
+  now: number = Date.now(),
+): number | null {
   if (!value) return null;
   const seconds = Number(value.trim());
   if (Number.isFinite(seconds) && seconds >= 0) {
@@ -79,6 +82,10 @@ export class AimdController {
     return this._concurrency;
   }
 
+  get maxConcurrency(): number {
+    return this.opts.maxConcurrency;
+  }
+
   /** Registrar el resultado de un request y ajustar la concurrencia. */
   report(signal: RateSignal): void {
     switch (signal) {
@@ -104,4 +111,42 @@ export class AimdController {
         break;
     }
   }
+}
+
+/**
+ * Delay entre corridas para un doc que ya falló `attempts` veces.
+ * El reintento se espacia exponencialmente (cap 60s) para no martillar
+ * un recurso que sigue fallando, sin abandonarlo nunca.
+ */
+export function crossRunDelay(attempts: number): number {
+  return Math.min(60_000, 1_000 * 2 ** (attempts - 1));
+}
+
+/**
+ * Semáforo adaptativo: la capacidad se lee por callback en cada `acquire`,
+ * así AIMD puede subir/bajar la concurrencia en caliente sin reconstruir
+ * el pool. Polling corto a propósito (el límite cambia en cualquier momento).
+ */
+export class AdaptiveSemaphore {
+  private active = 0;
+
+  constructor(private readonly limit: () => number) {}
+
+  async acquire(): Promise<void> {
+    for (;;) {
+      if (this.active < this.limit()) {
+        this.active++;
+        return;
+      }
+      await sleep(50);
+    }
+  }
+
+  release(): void {
+    if (this.active > 0) this.active--;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -9,9 +9,17 @@ describe("parseCli", () => {
     expect(opts.pages).toBe(0);
     expect(opts.maxFiles).toBe(0);
     expect(opts.concurrency).toBe(2);
+    expect(opts.sessions).toBe(1);
     expect(opts.minDelay).toBe(500);
     expect(opts.out).toBe("data");
     expect(opts.fresh).toBe(false);
+  });
+
+  it("parsea --sessions", () => {
+    const opts = parseCli(["node", "index.js", "--sessions", "3"]);
+    expect(opts.sessions).toBe(3);
+    expect(parseCli(["node", "index.js", "--sessions", "0"]).sessions).toBe(1);
+    expect(() => parseCli(["node", "index.js", "--sessions", "-2"])).toThrow();
   });
 
   it("parsea flags kebab-case (commander los camelCasea)", () => {

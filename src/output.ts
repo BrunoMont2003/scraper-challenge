@@ -1,6 +1,5 @@
-import { appendFileSync, writeFileSync } from "node:fs";
-import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { DetailRecord } from "./config";
 
 /** Registro plano de salida (1 por documento). */
@@ -182,7 +181,7 @@ export class OutputWriter {
   readonly jsonlPath: string;
   readonly csvPath: string;
 
-  constructor(private readonly outDir: string) {
+  constructor(outDir: string) {
     mkdirSync(outDir, { recursive: true });
     this.jsonlPath = join(outDir, "results.jsonl");
     this.csvPath = join(outDir, "results.csv");
@@ -201,18 +200,14 @@ export class OutputWriter {
 
   /** Reescribe el CSV completo desde los registros dados. */
   writeCsv(records: FlatRecord[]): void {
-    const escape = (value: unknown): string => {
+    const csvEscape = (value: unknown): string => {
       const s = String(value ?? "");
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const lines = [CSV_COLUMNS.join(",")];
     for (const record of records) {
-      lines.push(CSV_COLUMNS.map((col) => escape(record[col])).join(","));
+      lines.push(CSV_COLUMNS.map((col) => csvEscape(record[col])).join(","));
     }
     writeFileSync(this.csvPath, lines.join("\n") + "\n");
   }
-}
-
-export function ensureDir(dir: string): void {
-  mkdirSync(dirname(dir), { recursive: true });
 }

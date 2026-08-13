@@ -1,5 +1,7 @@
 # Scraper Jurisprudencia PJ
 
+[![CI](https://github.com/BrunoMont2003/scraper-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/BrunoMont2003/scraper-challenge/actions/workflows/ci.yml)
+
 Scraper en TypeScript para la Jurisprudencia Nacional Sistematizada del Poder Judicial del Perú. Puro HTTP (`axios` + `cheerio`), sin navegador.
 
 Dado un texto de búsqueda, recorre todas las páginas de resultados, extrae la ficha completa de cada documento, descarga sus archivos (PDF y Word) y deja todo listo para volver a correr sin repetir trabajo.
@@ -45,6 +47,7 @@ npm run scrape -- --query "homicidio" --fresh
 | `--pages <N>` | `0` | Límite de páginas (0 = todas) |
 | `--max-files <N>` | `0` | Límite de descargas (0 = todos) |
 | `--concurrency <N>` | `2` | Concurrencia inicial de descargas |
+| `--sessions <N>` | `1` | Sesiones de navegación paralelas (cada una su JSESSIONID). 1 = serial |
 | `--min-delay <ms>` | `500` | Delay mínimo entre requests |
 | `--out <dir>` | `data` | Directorio de salida |
 | `--fresh` | off | Borra el estado y scrapea desde cero |
@@ -76,6 +79,36 @@ Un registro de `results.jsonl`:
 }
 ```
 
+> `results.jsonl` / `results.csv` se sobrescriben por corrida y solo contienen
+> los documentos de la query actual. Para acumular varias búsquedas usa
+> `--out <dir>` distinto por query, o consolida desde `scraper.sqlite`.
+
+## Arquitectura
+
+```mermaid
+flowchart TD
+    CLI[cli.ts<br/>commander] --> MAIN[index.ts]
+    MAIN --> |Fase 1: crawl| WORKERS[SessionWorker x N]
+    WORKERS --> SEARCH[search.ts<br/>login + POST + 302]
+    WORKERS --> PAG[Paginate.ts]
+    WORKERS --> DET[detail.ts<br/>AJAX parcial RichFaces]
+    SEARCH --> HTTP[HTTP client<br/>retry + backoff + redirects]
+    PAG --> HTTP
+    DET --> HTTP
+    HTTP --> AIMD[AIMD rate limiter]
+    MAIN --> |Fase 2: downloads| DOWN[download.ts<br/>ServletDescarga]
+    DOWN --> HTTP
+    HTTP --> Q[(queue.ts<br/>SQLite WAL)]
+    MAIN --> |Fase 3: export| OUT[output.ts<br/>JSONL + CSV]
+    Q --> OUT
+    Q --> FAIL[failed.jsonl]
+```
+
+Fases: **crawl** (paginar + ficha de cada documento, sesiones en paralelo) →
+**descargas** (PDF/Word con pool AIMD, independiente de la sesión) →
+**export** (JSONL/CSV + manifest de fallidos). Cada fase relee la cola SQLite,
+que es la fuente de verdad y hace que re-correr sea idempotente.
+
 ## Cómo funciona
 
 El sitio es una aplicación JSF/Mojarra con RichFaces, y la búsqueda vive en la sesión del servidor. Recargar `resultado.xhtml` a secas devuelve la página vacía; para sacar datos hay que reproducir cada POST exacto del formulario y mantener cookie `JSESSIONID` + `javax.faces.ViewState`. El detalle está en [docs/spec.md](docs/spec.md).
@@ -86,9 +119,26 @@ Dos detalles que ahorran horas: la sesión expira a mitad de corrida con `ViewEx
 
 ## Errores y rate limiting
 
-Los PDFs devuelven 429 con frecuencia. La descarga usa un control de concurrencia estilo TCP: si las cosas van bien sube de a uno, ante un 429 o error 5xx baja a la mitad. Cada request lleva retry con full-jitter backoff y respeta el header `Retry-After`. Los archivos que no logran completarse quedan marcados como fallidos y se reintentan en la siguiente corrida; nunca se aborta por un documento.
+Los PDFs devuelven 429 con frecuencia. La descarga usa un control de concurrencia estilo TCP: si las cosas van bien sube de a uno, ante un 429 o error 5xx baja a la mitad. Cada request lleva retry con full-jitter backoff y respeta el header `Retry-After`. Los archivos que no logran completarse quedan marcados como fallidos y se reintentan en la siguiente corrida, con delay exponencial según cuántas veces ya fallaron; nunca se aborta por un documento.
 
-La cola es idempotente, así que correr dos veces no repite trabajo: hay delay mínimo entre requests, dedupe por `uuid`, y si matas el proceso a la mitad se retoma donde quedó al volver a abrir. Para borrar todo y empezar de cero, `--fresh`.
+Cada archivo se valida por **magic bytes** (`%PDF-`, OLE2 `D0CF11E0`): una página de error de 2KB disfrazada de PDF se rechaza y se marca como fallida en vez de guardarse corrupta.
+
+La cola es idempotente, así que correr dos veces no repite trabajo: hay delay mínimo entre requests, dedupe por `uuid`, y si matas el proceso a la mitad (incluso con Ctrl+C) se retoma donde quedó al volver a abrir. Para borrar todo y empezar de cero, `--fresh`.
+
+## Sesiones paralelas
+
+El sitio guarda el resultado de búsqueda en la sesión del servidor, así que dos
+`JSESSIONID` independientes pueden paginar en paralelo sin pisarse (cada una
+mantiene su propio `ViewState` rotante). `--sessions 2` reparte las páginas
+entre dos sesiones y duplica el throughput del crawl:
+
+```bash
+npm run scrape -- --query "homicidio" --sessions 2 --min-delay 300
+```
+
+Las descargas de PDF/Word son independientes de la sesión, así que esa fase ya
+era concurrente (AIMD) incluso con `--sessions 1`. Ajusta `--min-delay` con
+sesiones múltiples para no saturar el servidor.
 
 ## Proyecto
 
@@ -103,7 +153,8 @@ src/
 ├── parser.ts         # parse de la página de resultados
 ├── download.ts       # descarga PDF/Word vía ServletDescarga
 ├── queue.ts          # cola SQLite (checkpoint, dedupe, retry)
-├── ratelimit.ts      # AIMD + full-jitter backoff
+├── ratelimit.ts      # AIMD + full-jitter backoff + semáforo adaptativo
+├── session-worker.ts # una sesión de navegación (JSESSIONID + ViewState)
 ├── output.ts         # writers JSONL/CSV
 ├── logger.ts         # logs + resumen
 └── http/
@@ -118,8 +169,11 @@ tests/                # vitest, offline con fixtures reales
 
 ```bash
 npm run typecheck   # tsc --noEmit
+npm run lint        # biome (lint + formato)
 npm test            # vitest, sin tocar el servidor
 npm run build       # compila a dist/
 ```
+
+CI (GitHub Actions): `typecheck` → `lint` → `test` → `build` en cada push/PR a `main`.
 
 Los tests usan fixtures reales capturados del sitio (páginas de resultados, la ficha y una respuesta `ViewExpiredException`).
