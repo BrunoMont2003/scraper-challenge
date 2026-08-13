@@ -1,5 +1,5 @@
 import { load } from "cheerio";
-import type { CardRecord } from "./config";
+import { type CardRecord, RESULTS_PER_PAGE } from "./config";
 import { extractViewState } from "./http/session";
 
 export interface ParsedResultsPage {
@@ -26,20 +26,55 @@ const CARD_FIELDS: Record<string, keyof CardRecord> = {
   "Palabras Clave:": "palabras",
 };
 
-export function parseResultsPage(html: string): ParsedResultsPage {
+export interface ParseResultsOptions {
+  expectedPage?: number;
+}
+
+export class ProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ProtocolError";
+  }
+}
+
+export function requireViewState(body: string): string {
+  const value =
+    extractViewState(body) ||
+    /<update\s+id="javax\.faces\.ViewState"><!\[CDATA\[([\s\S]*?)\]\]><\/update>/
+      .exec(body)?.[1]
+      ?.trim() ||
+    "";
+  if (!value) throw new ProtocolError("Respuesta JSF sin javax.faces.ViewState");
+  return value;
+}
+
+function requireProtocol(condition: unknown, message: string): asserts condition {
+  if (!condition) throw new ProtocolError(message);
+}
+
+export function parseResultsPage(
+  html: string,
+  options: ParseResultsOptions = {},
+): ParsedResultsPage {
   const $ = load(html);
 
   const totalText = $('span[id$="optResultado"]').first().text().trim();
+  requireProtocol(totalText, "Estructura de resultados inválida: falta el total");
   const totalResults = parseNumber(totalText.match(/se obtuvieron\s+([\d.]+)\s+resultados/)?.[1]);
 
-  const spinnerValue = $('input[name="formBuscador:spinner"]').attr("value") ?? "1";
-  const currentPage = parseNumber(spinnerValue) || 1;
+  const spinnerValue = $('input[name="formBuscador:spinner"]').attr("value");
+  const currentPage = parseNumber(spinnerValue);
+  requireProtocol(currentPage > 0, "Estructura de resultados inválida: falta la página actual");
 
   // La celda "de N" está antes del botón IR (j_idt447).
   const lastPageCell = $('input[name="formBuscador:j_idt447"]').closest("td").prev("td");
-  const lastPage = parseNumber(lastPageCell.text()) || currentPage;
+  const lastPage = parseNumber(lastPageCell.text());
+  requireProtocol(
+    lastPage >= currentPage,
+    "Estructura de resultados inválida: paginación inconsistente",
+  );
 
-  const viewState = extractViewState(html);
+  const viewState = requireViewState(html);
 
   const cards: CardRecord[] = [];
   $('div[id^="formBuscador:repeat:"][id$=":j_idt455"]').each((_, el) => {
@@ -85,8 +120,21 @@ export function parseResultsPage(html: string): ParsedResultsPage {
       card.uuid = /uuid=([a-f0-9-]+)/i.exec(link)?.[1] ?? "";
     }
 
+    requireProtocol(card.uuid, `Card ${rowIndex} sin UUID`);
+
     cards.push(card);
   });
+
+  requireProtocol(
+    totalResults === 0 || (cards.length > 0 && cards.length <= RESULTS_PER_PAGE),
+    "Estructura de resultados inválida: cantidad de cards inesperada",
+  );
+  if (options.expectedPage !== undefined) {
+    requireProtocol(
+      currentPage === options.expectedPage,
+      `Se solicitó la página ${options.expectedPage}, pero la respuesta corresponde a la página ${currentPage}`,
+    );
+  }
 
   return { totalResults, currentPage, lastPage, viewState, cards };
 }

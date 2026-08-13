@@ -54,3 +54,29 @@ describe("parseResultsPage (página 2)", () => {
     expect(firstNroexp).toBe("000096-2026");
   });
 });
+
+describe("parseResultsPage protocol invariants", () => {
+  const pageOne = readFileSync(join(FIXTURES, "results-page1.html"), "utf8");
+  const pageTwo = readFileSync(join(FIXTURES, "results-page2.html"), "utf8");
+
+  it("rechaza respuestas sin ViewState", () => {
+    const withoutViewState = pageOne.replace(/<input[^>]+name="javax\.faces\.ViewState"[^>]*>/, "");
+    expect(() => parseResultsPage(withoutViewState)).toThrow(/ViewState/);
+  });
+
+  it("rechaza cards sin UUID", () => {
+    const firstUuid = parseResultsPage(pageOne).cards[0]!.uuid;
+    const encodedUuid = firstUuid.replace(/-/g, "\\\\u002D");
+    const withoutUuid = pageOne.replaceAll(encodedUuid, "").replaceAll(firstUuid, "");
+    expect(() => parseResultsPage(withoutUuid)).toThrow(/UUID/);
+  });
+
+  it("rechaza una página distinta de la solicitada", () => {
+    expect(() => parseResultsPage(pageTwo, { expectedPage: 1 })).toThrow(/página 1.*página 2/i);
+  });
+
+  it("rechaza una forma de resultados incompatible", () => {
+    const withoutCards = pageOne.replace(/formBuscador:repeat:/g, "formBuscador:removed:");
+    expect(() => parseResultsPage(withoutCards)).toThrow(/estructura.*resultados/i);
+  });
+});

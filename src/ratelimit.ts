@@ -64,6 +64,23 @@ export function jitteredBackoff(opts: BackoffOptions, attempt: number): number {
   return Math.floor(Math.random() * cap);
 }
 
+/**
+ * Serializes request starts for one host. Reservations are made synchronously,
+ * so concurrent clients cannot observe and claim the same start slot.
+ */
+export class HostPacer {
+  private nextStartAt = 0;
+
+  constructor(private readonly minDelayMs: number) {}
+
+  async waitTurn(): Promise<void> {
+    const now = Date.now();
+    const startAt = Math.max(now, this.nextStartAt);
+    this.nextStartAt = startAt + this.minDelayMs;
+    while (Date.now() < startAt) await sleep(startAt - Date.now());
+  }
+}
+
 /** Señal para el controller: qué pasó con el último request. */
 export type RateSignal = "success" | "rate-limited" | "server-error" | "network-error";
 

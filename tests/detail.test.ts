@@ -44,3 +44,28 @@ describe("parseDetail (ficha Ver Ficha)", () => {
     expect(detail.uuidWord).toBe("718e272f-f400-458e-96b9-3f6dcd973f67");
   });
 });
+
+describe("parseDetail protocol invariants", () => {
+  const xml = readFileSync(join(FIXTURES, "detail-popup.xml"), "utf8");
+
+  it("rechaza una respuesta sin popup", () => {
+    const withoutPopup = xml.replace('id="formBuscador:popupResolucion"', 'id="removed"');
+    expect(() => parseDetail(withoutPopup)).toThrow(/popup/i);
+  });
+
+  it("rechaza una respuesta sin ViewState rotado", () => {
+    const withoutViewState = xml.replace(
+      /<update id="javax\.faces\.ViewState"><!\[CDATA\[[\s\S]*?\]\]><\/update>/,
+      "",
+    );
+    expect(() => parseDetail(withoutViewState)).toThrow(/ViewState/);
+  });
+
+  it("rechaza un popup sin la estructura de ficha esperada", () => {
+    const malformed = xml.replace(
+      /<div class="panel panel-gris">[\s\S]*<\/div>\]\]><\/update>/,
+      "</div>]]></update>",
+    );
+    expect(() => parseDetail(malformed)).toThrow(/estructura.*ficha/i);
+  });
+});

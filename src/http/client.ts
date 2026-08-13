@@ -4,6 +4,7 @@ import {
   type AimdController,
   type BackoffOptions,
   DEFAULT_BACKOFF,
+  HostPacer,
   jitteredBackoff,
   parseRetryAfter,
   type RateSignal,
@@ -21,6 +22,7 @@ export interface ClientOptions {
   backoff?: Partial<BackoffOptions>;
   aimd?: AimdController;
   timeoutMs?: number;
+  pacer?: HostPacer;
 }
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
@@ -37,23 +39,14 @@ const DEFAULT_TIMEOUT = 30_000;
  * - delay mínimo entre requests (politeness).
  */
 export class HttpClient {
-  private lastRequestAt = 0;
   private readonly backoff: BackoffOptions;
   private readonly aimd: AimdController | undefined;
+  private readonly pacer: HostPacer;
 
   constructor(private readonly opts: ClientOptions) {
     this.backoff = { ...DEFAULT_BACKOFF, ...opts.backoff };
     this.aimd = opts.aimd;
-  }
-
-  private async waitTurn(): Promise<void> {
-    const elapsed = Date.now() - this.lastRequestAt;
-    const min = this.opts.minDelayMs;
-    if (elapsed < min) {
-      const jitter = Math.floor(Math.random() * min * 0.2);
-      await sleep(min - elapsed + jitter);
-    }
-    this.lastRequestAt = Date.now();
+    this.pacer = opts.pacer ?? new HostPacer(opts.minDelayMs);
   }
 
   /** Un request sin retry ni redirects (uso interno). */
@@ -64,7 +57,7 @@ export class HttpClient {
     responseType: "text" | "arraybuffer" = "text",
     extraHeaders: Record<string, string> = {},
   ): Promise<HttpResult> {
-    await this.waitTurn();
+    await this.pacer.waitTurn();
     try {
       const res = await axios.request({
         method,

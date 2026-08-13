@@ -9,7 +9,8 @@ import {
   SITE,
 } from "./config";
 import type { HttpClient } from "./http/client";
-import { extractViewState, SiteSession } from "./http/session";
+import { SiteSession } from "./http/session";
+import { ProtocolError, requireViewState } from "./parser";
 
 const AJAX_HEADERS = {
   "Faces-Request": "partial/ajax",
@@ -43,7 +44,7 @@ export class DetailClient {
       throw new Error(`Error AJAX: ${name}`);
     }
 
-    const vs = extractViewState(body);
+    const vs = requireViewState(body);
     this.session.setViewState(vs);
 
     return parseDetail(body);
@@ -56,21 +57,29 @@ export function parseDetail(partialXml: string): DetailRecord {
   const cdata = /id="formBuscador:popupResolucion"><!\[CDATA\[([\s\S]*?)\]\]><\/update>/.exec(
     partialXml,
   )?.[1];
-  if (!cdata) return { ...EMPTY_DETAIL };
+  if (!cdata) throw new ProtocolError("Respuesta de detalle sin popupResolucion");
+  requireViewState(partialXml);
 
   const $ = load(cdata);
   const record: DetailRecord = { ...EMPTY_DETAIL };
 
   const panels = $(".panel-gris").toArray();
+  let hasResolution = false;
+  let hasProcess = false;
   for (const panelEl of panels) {
     const heading = normalizeLabel($(panelEl).find(".panel-heading").text());
     if (heading.includes("datos de la resolucion")) {
+      hasResolution = true;
       applyPanel($, panelEl, RESOLUCION_FIELDS, record);
     } else if (heading.includes("datos del proceso")) {
+      hasProcess = true;
       applyPanel($, panelEl, PROCESO_FIELDS, record);
     } else if (heading.includes("datos de procedencia")) {
       applyPanel($, panelEl, PROCEDENCIA_FIELDS, record);
     }
+  }
+  if (!hasResolution || !hasProcess) {
+    throw new ProtocolError("Estructura de ficha inválida: faltan paneles obligatorios");
   }
 
   // Archivo de la Resolución: links PDF/Word dentro de cualquier panel.
