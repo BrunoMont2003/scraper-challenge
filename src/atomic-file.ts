@@ -12,23 +12,6 @@ export function commitTemporary(temporaryPath: string, targetPath: string): void
   renameSync(temporaryPath, targetPath);
 }
 
-export function atomicReplaceSync(
-  targetPath: string,
-  write: (temporaryPath: string) => void,
-  validate: (temporaryPath: string) => void = () => undefined,
-): void {
-  const temporaryPath = temporarySibling(targetPath);
-  removeTemporary(temporaryPath);
-  try {
-    write(temporaryPath);
-    validate(temporaryPath);
-    commitTemporary(temporaryPath, targetPath);
-  } catch (error) {
-    if (existsSync(temporaryPath)) removeTemporary(temporaryPath);
-    throw error;
-  }
-}
-
 export async function atomicReplace(
   targetPath: string,
   write: (temporaryPath: string) => Promise<void>,

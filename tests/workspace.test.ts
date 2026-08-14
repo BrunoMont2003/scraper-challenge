@@ -47,6 +47,8 @@ describe("ScraperWorkspace", () => {
     writeFileSync(join(output, "scraper.sqlite-shm"), "shm");
     writeFileSync(join(output, "results.jsonl"), "result");
     writeFileSync(join(output, "results.csv.tmp"), "partial");
+    writeFileSync(join(output, "failed.jsonl"), "legacy");
+    writeFileSync(join(output, "unresolved.jsonl"), "current");
     writeFileSync(join(output, "pdfs", "owned.pdf"), "pdf");
     writeFileSync(join(output, "notes.txt"), "keep me");
     writeFileSync(join(sibling, "scraper.sqlite"), "sibling database");
@@ -58,9 +60,23 @@ describe("ScraperWorkspace", () => {
     expect(existsSync(join(output, "scraper.sqlite-shm"))).toBe(false);
     expect(existsSync(join(output, "results.jsonl"))).toBe(false);
     expect(existsSync(join(output, "results.csv.tmp"))).toBe(false);
+    expect(existsSync(join(output, "failed.jsonl"))).toBe(false);
+    expect(existsSync(join(output, "unresolved.jsonl"))).toBe(false);
     expect(existsSync(join(output, "pdfs"))).toBe(false);
     expect(readFileSync(join(output, "notes.txt"), "utf8")).toBe("keep me");
     expect(readFileSync(join(sibling, "scraper.sqlite"), "utf8")).toBe("sibling database");
+  });
+
+  it("removes the legacy manifest only when explicitly finalized", () => {
+    const output = temporaryRoot();
+    writeFileSync(join(output, "failed.jsonl"), "legacy unresolved work");
+    writeFileSync(join(output, "unresolved.jsonl"), "replacement");
+    const workspace = ScraperWorkspace.open(output);
+
+    workspace.removeLegacyFailedManifest();
+
+    expect(existsSync(join(output, "failed.jsonl"))).toBe(false);
+    expect(readFileSync(join(output, "unresolved.jsonl"), "utf8")).toBe("replacement");
   });
 
   it("unlinks an allowlisted symlink without traversing its external target", () => {

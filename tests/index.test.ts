@@ -7,12 +7,34 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("axios", () => ({ default: { request: vi.fn() } }));
 
 import { EMPTY_DETAIL } from "../src/config";
-import { main, toOutputRecord } from "../src/index";
+import {
+  canReuseCompletedCrawl,
+  main,
+  requestedFileKinds,
+  requestedPhases,
+  toOutputRecord,
+} from "../src/index";
 import type { DocRow } from "../src/queue";
 
 const argv = (out: string): string[] => ["node", "scraper", "--out", out, "--quiet"];
 
 describe("main process contract", () => {
+  it("reuses an explicitly bounded crawl when every requested page is durable", () => {
+    const queue = { pendingPages: vi.fn(() => []) };
+    expect(canReuseCompletedCrawl(queue, 7, 3)).toBe(true);
+    expect(queue.pendingPages).toHaveBeenCalledWith(7, 3);
+    expect(canReuseCompletedCrawl(queue, 7, 0)).toBe(false);
+  });
+
+  it("schedules PDF alone by default and adds Word only when requested", () => {
+    expect(requestedFileKinds(false)).toEqual(["pdf"]);
+    expect(requestedFileKinds(true)).toEqual(["pdf", "word"]);
+  });
+
+  it("presents every requested phase even when resume has no pending work", () => {
+    expect(requestedPhases(false)).toEqual(["Search", "Details", "PDFs", "Export"]);
+    expect(requestedPhases(true)).toEqual(["Search", "Details", "PDFs", "Word", "Export"]);
+  });
   it("has no network or process side effect when imported", () => {
     expect(axios.request).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
@@ -63,6 +85,8 @@ describe("main process contract", () => {
       word_error: null,
       pdf_path: null,
       word_path: null,
+      pdf_next_eligible_at: null,
+      word_next_eligible_at: null,
       detail_scraped_at: "2026-06-01 02:03:04",
       updated_at: "2026-08-13 19:00:00",
     } satisfies DocRow;

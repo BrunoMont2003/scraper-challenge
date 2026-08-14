@@ -13,6 +13,12 @@ describe("parseCli", () => {
     expect(opts.minDelay).toBe(500);
     expect(opts.out).toBe("data");
     expect(opts.fresh).toBe(false);
+    expect(opts.word).toBe(false);
+  });
+
+  it("downloads PDF by default and makes Word additive", () => {
+    expect(parseCli(["node", "index.js"]).word).toBe(false);
+    expect(parseCli(["node", "index.js", "--word"]).word).toBe(true);
   });
 
   it("parsea --sessions", () => {

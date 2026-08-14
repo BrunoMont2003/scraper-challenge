@@ -4,12 +4,12 @@ import { HttpClient } from "../src/http/client";
 import {
   AdaptiveSemaphore,
   AimdController,
-  crossRunDelay,
   DEFAULT_BACKOFF,
   HostPacer,
   jitteredBackoff,
   parseRetryAfter,
 } from "../src/ratelimit";
+import { SessionWorker } from "../src/session-worker";
 
 vi.mock("axios", () => ({
   default: {
@@ -19,6 +19,80 @@ vi.mock("axios", () => ({
 }));
 
 describe("HostPacer", () => {
+  it("observes navigation attempts through SessionWorker", async () => {
+    const statuses: number[] = [];
+    vi.mocked(axios.request).mockResolvedValue({ status: 200, headers: {}, data: "ok" });
+    const worker = new SessionWorker({
+      minDelayMs: 0,
+      onRequest: (observation) => statuses.push(observation.status),
+    });
+    await worker.http.getText("https://example.test");
+    expect(statuses).toEqual([200]);
+  });
+  it("shares Retry-After cooldown across every admitted request", async () => {
+    let now = 1_000;
+    const waits: number[] = [];
+    const pacer = new HostPacer(100, {
+      now: () => now,
+      sleep: async (ms) => {
+        waits.push(ms);
+        now += ms;
+      },
+      random: () => 0.5,
+    });
+    await pacer.start(async () => "first");
+    pacer.report("rate-limited", "2");
+    await pacer.start(async () => "second");
+    expect(waits).toEqual([2_000]);
+    expect(pacer.cooldownUntil).toBe(3_000);
+  });
+
+  it("applies exponential full-jitter backoff in the production HTTP retry path", async () => {
+    const waits: number[] = [];
+    let now = 1_000;
+    vi.mocked(axios.request).mockClear();
+    vi.mocked(axios.request)
+      .mockResolvedValueOnce({ status: 429, headers: {}, data: "limited" })
+      .mockResolvedValueOnce({ status: 200, headers: {}, data: "ok" });
+    const client = new HttpClient({
+      minDelayMs: 0,
+      backoff: { baseMs: 1_000, maxMs: 10_000, maxAttempts: 1 },
+      random: () => 0.5,
+      pacer: new HostPacer(0, {
+        now: () => now,
+        random: () => 0,
+        sleep: async (ms) => {
+          waits.push(ms);
+          now += ms;
+        },
+      }),
+    });
+
+    await expect(client.getText("https://example.test")).resolves.toMatchObject({ status: 200 });
+    expect(waits).toEqual([500]);
+    expect(axios.request).toHaveBeenCalledTimes(2);
+  });
+
+  it("increases its interval under pressure and recovers after successful requests", () => {
+    let now = 10_000;
+    const pacer = new HostPacer(100, { now: () => now, sleep: async () => {}, random: () => 0 });
+    pacer.report("rate-limited");
+    expect(pacer.intervalMs).toBe(200);
+    for (let index = 0; index < 2; index++) {
+      now += 1_000;
+      pacer.report("success");
+    }
+    expect(pacer.intervalMs).toBe(100);
+  });
+
+  it("bounds adaptive spacing without turning cooldown into minute-long success delays", () => {
+    const pacer = new HostPacer(100, { now: () => 1_000, sleep: async () => {}, random: () => 0 });
+    pacer.report("rate-limited");
+    pacer.report("rate-limited");
+    expect(pacer.intervalMs).toBe(400);
+    for (let index = 0; index < 20; index++) pacer.report("rate-limited");
+    expect(pacer.intervalMs).toBe(400);
+  });
   it("preserva el delay mínimo entre clientes concurrentes del mismo host", async () => {
     const starts: number[] = [];
     vi.mocked(axios.request).mockImplementation(async () => {
@@ -148,15 +222,6 @@ describe("AimdController", () => {
     expect(c.concurrency).toBe(2);
     c.report("success");
     expect(c.concurrency).toBe(2); // aún en cooldown
-  });
-});
-
-describe("crossRunDelay", () => {
-  it("espacia exponencialmente y hace cap a 60s", () => {
-    expect(crossRunDelay(1)).toBe(1_000);
-    expect(crossRunDelay(2)).toBe(2_000);
-    expect(crossRunDelay(6)).toBeLessThanOrEqual(60_000);
-    expect(crossRunDelay(100)).toBe(60_000);
   });
 });
 

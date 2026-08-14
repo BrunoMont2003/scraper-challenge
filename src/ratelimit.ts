@@ -59,23 +59,65 @@ export function parseRetryAfter(
 }
 
 /** Delay de backoff con full jitter para el intento `attempt` (0-based). */
-export function jitteredBackoff(opts: BackoffOptions, attempt: number): number {
+export function jitteredBackoff(
+  opts: BackoffOptions,
+  attempt: number,
+  random: () => number = Math.random,
+): number {
   const cap = Math.min(opts.maxMs, opts.baseMs * 2 ** attempt);
-  return Math.floor(Math.random() * cap);
+  return Math.floor(random() * cap);
 }
 
 /**
- * Serializes request starts for one host. Reservations are made synchronously,
- * so concurrent clients cannot observe and claim the same start slot.
+ * Serializes request starts for one host, so concurrent clients cannot claim
+ * the same start slot.
  */
 export class HostPacer {
   private lastStartAt = 0;
   private turns: Promise<void> = Promise.resolve();
+  private notBefore = 0;
+  private currentIntervalMs: number;
+  private readonly deps: {
+    now: () => number;
+    sleep: (ms: number) => Promise<void>;
+    random: () => number;
+  };
 
-  constructor(private readonly minDelayMs: number) {}
+  constructor(
+    private readonly minDelayMs: number,
+    deps: Partial<{
+      now: () => number;
+      sleep: (ms: number) => Promise<void>;
+      random: () => number;
+    }> = {},
+  ) {
+    this.currentIntervalMs = minDelayMs;
+    this.deps = { now: Date.now, sleep, random: Math.random, ...deps };
+  }
 
-  async waitTurn(): Promise<void> {
-    await this.reserveTurn();
+  get cooldownUntil(): number {
+    return this.notBefore;
+  }
+
+  get intervalMs(): number {
+    return this.currentIntervalMs;
+  }
+
+  report(signal: RateSignal, retryAfter?: string, retryDelayMs?: number): void {
+    if (signal === "success") {
+      this.currentIntervalMs = Math.max(this.minDelayMs, Math.floor(this.currentIntervalMs * 0.7));
+      return;
+    }
+    this.currentIntervalMs = Math.min(
+      Math.max(this.minDelayMs, Math.min(2_000, this.minDelayMs * 4)),
+      Math.max(Math.max(this.minDelayMs, 1) * 2, this.currentIntervalMs * 2),
+    );
+    const parsed = parseRetryAfter(retryAfter, this.deps.now());
+    const fallback = Math.floor(this.deps.random() * Math.max(1_000, this.currentIntervalMs));
+    this.notBefore = Math.max(
+      this.notBefore,
+      this.deps.now() + (parsed ?? retryDelayMs ?? fallback),
+    );
   }
 
   start<T>(operation: () => Promise<T>): Promise<T> {
@@ -84,28 +126,20 @@ export class HostPacer {
         await this.waitForDelay();
         try {
           const result = operation();
-          this.lastStartAt = Date.now();
+          this.lastStartAt = this.deps.now();
           resolve(result);
         } catch (error) {
-          this.lastStartAt = Date.now();
+          this.lastStartAt = this.deps.now();
           reject(error);
         }
       });
     });
   }
 
-  private reserveTurn(): Promise<void> {
-    const turn = this.turns.then(async () => {
-      await this.waitForDelay();
-      this.lastStartAt = Date.now();
-    });
-    this.turns = turn;
-    return turn;
-  }
-
   private async waitForDelay(): Promise<void> {
-    const elapsed = Date.now() - this.lastStartAt;
-    if (elapsed < this.minDelayMs) await sleep(this.minDelayMs - elapsed);
+    const nextStart = Math.max(this.notBefore, this.lastStartAt + this.currentIntervalMs);
+    const delay = nextStart - this.deps.now();
+    if (delay > 0) await this.deps.sleep(delay);
   }
 }
 
@@ -156,15 +190,6 @@ export class AimdController {
         break;
     }
   }
-}
-
-/**
- * Delay entre corridas para un doc que ya falló `attempts` veces.
- * El reintento se espacia exponencialmente (cap 60s) para no martillar
- * un recurso que sigue fallando, sin abandonarlo nunca.
- */
-export function crossRunDelay(attempts: number): number {
-  return Math.min(60_000, 1_000 * 2 ** (attempts - 1));
 }
 
 /**

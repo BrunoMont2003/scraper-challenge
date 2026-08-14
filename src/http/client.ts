@@ -7,7 +7,6 @@ import {
   DEFAULT_BACKOFF,
   HostPacer,
   jitteredBackoff,
-  parseRetryAfter,
   type RateSignal,
 } from "../ratelimit";
 
@@ -30,6 +29,14 @@ export interface ClientOptions {
   aimd?: AimdController;
   timeoutMs?: number;
   pacer?: HostPacer;
+  onRequest?: (observation: RequestObservation) => void;
+  random?: () => number;
+}
+
+export interface RequestObservation {
+  status: number;
+  retry: boolean;
+  retryAfter?: string;
 }
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
@@ -49,11 +56,13 @@ export class HttpClient {
   private readonly backoff: BackoffOptions;
   private readonly aimd: AimdController | undefined;
   private readonly pacer: HostPacer;
+  private readonly random: () => number;
 
   constructor(private readonly opts: ClientOptions) {
     this.backoff = { ...DEFAULT_BACKOFF, ...opts.backoff };
     this.aimd = opts.aimd;
     this.pacer = opts.pacer ?? new HostPacer(opts.minDelayMs);
+    this.random = opts.random ?? Math.random;
   }
 
   /** Un request sin retry ni redirects (uso interno). */
@@ -111,23 +120,33 @@ export class HttpClient {
         if (res.status === 429 || (res.status >= 500 && res.status <= 599)) {
           const signal: RateSignal = res.status === 429 ? "rate-limited" : "server-error";
           this.aimd?.report(signal);
+          const retryDelay = jitteredBackoff(this.backoff, attempt, this.random);
+          this.pacer.report(signal, res.headers["retry-after"], retryDelay);
+          this.opts.onRequest?.({
+            status: res.status,
+            retry: attempt > 0,
+            retryAfter: res.headers["retry-after"],
+          });
           if (attempt >= this.backoff.maxAttempts) {
             return res; // agotado: devolver y dejar que el caller decida
           }
-          const retryAfter = parseRetryAfter(res.headers["retry-after"]);
-          const delay = retryAfter ?? jitteredBackoff(this.backoff, attempt);
-          await sleep(delay);
           attempt += 1;
           continue;
         }
         this.aimd?.report("success");
+        this.pacer.report("success");
+        this.opts.onRequest?.({ status: res.status, retry: attempt > 0 });
         return res;
       } catch (err) {
         this.aimd?.report("network-error");
+        this.pacer.report(
+          "network-error",
+          undefined,
+          jitteredBackoff(this.backoff, attempt, this.random),
+        );
         if (attempt >= this.backoff.maxAttempts) {
           throw err;
         }
-        await sleep(jitteredBackoff(this.backoff, attempt));
         attempt += 1;
       }
     }
@@ -217,19 +236,30 @@ export class HttpClient {
         if (result.status === 429 || (result.status >= 500 && result.status <= 599)) {
           const signal: RateSignal = result.status === 429 ? "rate-limited" : "server-error";
           this.aimd?.report(signal);
+          const retryDelay = jitteredBackoff(this.backoff, attempt, this.random);
+          this.pacer.report(signal, result.headers["retry-after"], retryDelay);
+          this.opts.onRequest?.({
+            status: result.status,
+            retry: attempt > 0,
+            retryAfter: result.headers["retry-after"],
+          });
           if (attempt >= this.backoff.maxAttempts) return result;
           result.data.destroy();
-          const retryAfter = parseRetryAfter(result.headers["retry-after"]);
-          await sleep(retryAfter ?? jitteredBackoff(this.backoff, attempt));
           attempt++;
           continue;
         }
         this.aimd?.report("success");
+        this.pacer.report("success");
+        this.opts.onRequest?.({ status: result.status, retry: attempt > 0 });
         return result;
       } catch (error) {
         this.aimd?.report("network-error");
+        this.pacer.report(
+          "network-error",
+          undefined,
+          jitteredBackoff(this.backoff, attempt, this.random),
+        );
         if (attempt >= this.backoff.maxAttempts) throw error;
-        await sleep(jitteredBackoff(this.backoff, attempt));
         attempt++;
       }
     }
@@ -262,8 +292,4 @@ export class NetworkError extends Error {
     super(axios.isAxiosError(cause) && cause.code === "ETIMEDOUT" ? "timeout" : "network error");
     this.name = "NetworkError";
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

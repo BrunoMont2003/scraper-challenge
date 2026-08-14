@@ -67,9 +67,9 @@ The XML partial response must contain a new ViewState and the `formBuscador:popu
 
 **Evidence:** `src/detail.ts`, `tests/detail.test.ts`, `tests/fixtures/detail-popup.xml`.
 
-### 6. Recover expired views
+### 6. Recover invalid session views
 
-A response containing `ViewExpiredException` or `could not be restored` is treated as an expired JSF view. A worker creates a fresh login/search state and, for work beyond page one, navigates back to the requested page before retrying. Page and detail recovery is bounded to three attempts by default; exhausted work is persisted as failed and sibling pages continue.
+A response containing `ViewExpiredException`, `could not be restored`, a missing detail popup, or another invalid JSF result/detail structure is treated as a desynchronized session view. A worker creates a fresh login/search state and, for work beyond page one, navigates back to the requested page before retrying. Recovery is bounded to three attempts by default; exhausted work is persisted as failed and sibling pages continue.
 
 **Evidence:** `src/http/session.ts`, `src/session-worker.ts`, `tests/pipeline.test.ts`, `tests/fixtures/view-expired.xml`.
 
@@ -81,6 +81,8 @@ The production download phase uses an HTTP client without a session cookie and r
 GET /jurisprudenciaweb/ServletDescarga?uuid=<file-uuid>
 ```
 
+All clients share one host pacer. Retryable 429, 5xx, and network failures use exponential full-jitter backoff; `Retry-After` takes precedence when present. A 429 also opens a host-wide cooldown and the download phase defers sibling artifacts instead of exhausting each one during the same throttle window. Deferred eligibility is persisted. Short remaining waits resume with a visible countdown; an artifact that reaches three attempts transitions to failed with its diagnostic retained.
+
 A response is publishable only when it is HTTP 200, is not HTML, is at least 1,000 bytes, and has the expected magic bytes (`%PDF-` for PDF or OLE2 for Word). The response stream is written to a sibling temporary file and atomically renamed after validation.
 
 **Evidence:** `src/index.ts`, `src/download.ts`, `tests/download.test.ts`.
@@ -91,6 +93,7 @@ A response is publishable only when it is HTTP 200, is not HTML, is at least 1,0
 |---|---|---|
 | Session state | One cookie/ViewState pair per crawl worker | `tests/pipeline.test.ts` |
 | Host load | One shared pacer controls actual request starts | `tests/ratelimit.test.ts` |
+| Retry pressure | Exponential full-jitter backoff, `Retry-After`, durable cooldown, bounded artifact attempts | `tests/ratelimit.test.ts`, `tests/queue.test.ts` |
 | Malformed page | Reject missing ViewState, UUID, page identity, or result shape | `tests/parser.test.ts` |
 | Malformed detail | Reject missing popup or mandatory panels | `tests/detail.test.ts` |
 | Expired view | Re-login, repeat search, restore page, retry within a bound | `tests/pipeline.test.ts` |
@@ -117,4 +120,3 @@ npm run test:live
 ```
 
 The live smoke proves only that bounded path at execution time. It does not validate a complete crawl or run in CI.
-

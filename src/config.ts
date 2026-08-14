@@ -35,6 +35,8 @@ export interface CliOptions {
   fresh: boolean;
   /** Solo errores y resumen. */
   quiet: boolean;
+  /** Descargar también el artefacto Word; PDF siempre se solicita. */
+  word: boolean;
 }
 
 export const DEFAULT_OPTIONS: CliOptions = {
@@ -50,6 +52,7 @@ export const DEFAULT_OPTIONS: CliOptions = {
   out: "data",
   fresh: false,
   quiet: false,
+  word: false,
 };
 
 export interface RunScope {

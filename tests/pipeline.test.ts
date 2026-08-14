@@ -1,7 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { processPageIsolated, withBoundedRecovery } from "../src/session-worker";
+import { describe, expect, it, vi } from "vitest";
+import { processPageIsolated, SessionWorker, withBoundedRecovery } from "../src/session-worker";
 
 describe("bounded JSF recovery", () => {
+  it("retries a malformed search response with a fresh site search", async () => {
+    const worker = new SessionWorker({ minDelayMs: 0 });
+    const search = vi
+      .spyOn(worker.searchClient, "search")
+      .mockRejectedValueOnce(new Error("Estructura de resultados inválida: falta el total"))
+      .mockResolvedValueOnce({
+        cards: [],
+        currentPage: 1,
+        lastPage: 1,
+        totalResults: 1,
+        viewState: "ok",
+      });
+
+    await expect(
+      worker.ensureSearched({ query: "penal", corte: "1", especialidad: "", anio: "" }),
+    ).resolves.toMatchObject({ totalResults: 1 });
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
   it("recupera una vez y limita un fallo persistente", async () => {
     let attempts = 0;
     const recovered = await withBoundedRecovery(
@@ -26,6 +45,25 @@ describe("bounded JSF recovery", () => {
       ),
     ).rejects.toThrow(/ViewExpired/);
     expect(attempts).toBe(3);
+  });
+
+  it("recovers transient JSF detail structures before declaring a document failed", async () => {
+    let attempts = 0;
+    let recoveries = 0;
+    const detail = await withBoundedRecovery(
+      async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("Respuesta de detalle sin popupResolucion");
+        return "detail restored";
+      },
+      async () => {
+        recoveries++;
+      },
+      3,
+    );
+
+    expect(detail).toBe("detail restored");
+    expect({ attempts, recoveries }).toEqual({ attempts: 2, recoveries: 1 });
   });
 });
 

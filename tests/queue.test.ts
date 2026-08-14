@@ -31,6 +31,33 @@ function makeCard(uuid: string, rowIndex = 0): CardRecord {
 }
 
 describe("JobQueue (in-memory)", () => {
+  it("migrates v2 databases transactionally and preserves eligible work", () => {
+    const directory = mkdtempSync(join(tmpdir(), "scraper-v2-"));
+    const dbPath = join(directory, "scraper.sqlite");
+    const old = new Database(dbPath);
+    old.exec(`
+      CREATE TABLE runs (id INTEGER PRIMARY KEY, query TEXT NOT NULL, corte TEXT NOT NULL,
+        especialidad TEXT NOT NULL, anio TEXT NOT NULL, UNIQUE(query,corte,especialidad,anio));
+      CREATE TABLE pages (run_id INTEGER NOT NULL, page INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, scraped_at TEXT, PRIMARY KEY(run_id,page));
+      CREATE TABLE docs (run_id INTEGER NOT NULL, uuid TEXT NOT NULL, page INTEGER NOT NULL, row_index INTEGER NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}', detail_status TEXT NOT NULL DEFAULT 'pending', pdf_status TEXT NOT NULL DEFAULT 'pending',
+        word_status TEXT NOT NULL DEFAULT 'pending', detail_attempts INTEGER NOT NULL DEFAULT 0, pdf_attempts INTEGER NOT NULL DEFAULT 0,
+        word_attempts INTEGER NOT NULL DEFAULT 0, detail_error TEXT, pdf_error TEXT, word_error TEXT, pdf_path TEXT, word_path TEXT,
+        detail_scraped_at TEXT, updated_at TEXT, PRIMARY KEY(run_id,uuid));
+      PRAGMA user_version=2;
+    `);
+    old.close();
+
+    const q = new JobQueue(dbPath);
+    const columns = new Database(dbPath).prepare("PRAGMA table_info(docs)").all() as Array<{
+      name: string;
+    }>;
+    expect(columns.map((column) => column.name)).toContain("pdf_next_eligible_at");
+    expect(columns.map((column) => column.name)).toContain("word_next_eligible_at");
+    q.close();
+  });
+
   it("dedupe por uuid: insertCard devuelve false la segunda vez", () => {
     const q = new JobQueue(":memory:");
     const runId = q.getOrCreateRun(DEFAULT_SCOPE);
@@ -87,6 +114,45 @@ describe("JobQueue (in-memory)", () => {
     const jobs = q.pendingDownloads(runId, "word");
     expect(jobs).toHaveLength(1);
     expect(jobs[0]!.fileUuid).toBe("");
+    q.close();
+  });
+
+  it("defers artifacts until their durable eligibility time and reconciles metrics", () => {
+    const q = new JobQueue(":memory:");
+    const runId = q.getOrCreateRun(DEFAULT_SCOPE);
+    q.insertCard(runId, 1, makeCard("uuid-deferred"));
+    q.setDetail(runId, "uuid-deferred", { ...EMPTY_DETAIL, uuidPdf: "pdf-id" });
+    q.incrementAttempts(runId, "uuid-deferred", "pdf");
+    q.deferFile(runId, "uuid-deferred", "pdf", 2_000, "HTTP 429");
+
+    expect(q.pendingDownloads(runId, "pdf", 1_999, 3)).toHaveLength(0);
+    expect(q.pendingDownloads(runId, "pdf", 2_000, 3)).toHaveLength(1);
+    expect(q.artifactMetrics(runId, ["pdf"])).toEqual({
+      requested: 1,
+      succeeded: 0,
+      failed: 0,
+      deferred: 1,
+      attempts: 1,
+    });
+    q.close();
+  });
+
+  it("reconciles only the artifacts selected by max-files", () => {
+    const q = new JobQueue(":memory:");
+    const runId = q.getOrCreateRun(DEFAULT_SCOPE);
+    for (let index = 0; index < 3; index++) {
+      const uuid = `uuid-limit-${index}`;
+      q.insertCard(runId, 1, makeCard(uuid, index));
+      q.setDetail(runId, uuid, { ...EMPTY_DETAIL, uuidPdf: `pdf-${index}` });
+    }
+    q.markFile(runId, "uuid-limit-0", "pdf", "done", "pdfs/0.pdf");
+    expect(q.artifactMetrics(runId, ["pdf"], 1)).toEqual({
+      requested: 1,
+      succeeded: 1,
+      failed: 0,
+      deferred: 0,
+      attempts: 0,
+    });
     q.close();
   });
 
@@ -156,6 +222,41 @@ describe("JobQueue (in-memory)", () => {
     expect(completed.detail_error).toBeNull();
     expect(completed.pdf_error).toBeNull();
     expect(completed.word_attempts).toBe(0);
+    q.close();
+  });
+
+  it("exposes deferred work even before it becomes eligible", () => {
+    const q = new JobQueue(":memory:");
+    const runId = q.getOrCreateRun(DEFAULT_SCOPE);
+    for (const [index, uuid] of ["deferred-1", "deferred-2"].entries()) {
+      q.insertCard(runId, 1, makeCard(uuid, index));
+      q.setDetail(runId, uuid, { ...EMPTY_DETAIL, uuidPdf: `pdf-${index}` });
+      q.incrementAttempts(runId, uuid, "pdf");
+      q.deferFile(runId, uuid, "pdf", 30_000 + index * 1_000, "HTTP 429");
+    }
+
+    expect(q.pendingDownloads(runId, "pdf", 10_000, 3)).toEqual([]);
+    expect(q.deferredDownloadWindow(runId, "pdf", 3)).toEqual({
+      count: 2,
+      nextEligibleAt: 30_000,
+    });
+    q.close();
+  });
+
+  it("terminalizes deferred files whose retry budget is exhausted", () => {
+    const q = new JobQueue(":memory:");
+    const runId = q.getOrCreateRun(DEFAULT_SCOPE);
+    q.insertCard(runId, 1, makeCard("exhausted"));
+    q.setDetail(runId, "exhausted", { ...EMPTY_DETAIL, uuidPdf: "pdf-exhausted" });
+    for (let attempt = 0; attempt < 3; attempt++) q.incrementAttempts(runId, "exhausted", "pdf");
+    q.deferFile(runId, "exhausted", "pdf", 30_000, "HTTP 429");
+
+    expect(q.failExhaustedFiles(runId, "pdf", 3)).toBe(1);
+    expect(q.getDoc(runId, "exhausted")).toMatchObject({
+      pdf_status: "failed",
+      pdf_next_eligible_at: null,
+    });
+    expect(q.artifactMetrics(runId, ["pdf"])).toMatchObject({ failed: 1, deferred: 0 });
     q.close();
   });
 

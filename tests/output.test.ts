@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { atomicReplaceSync } from "../src/atomic-file";
+import { atomicReplace } from "../src/atomic-file";
 import { type FlatRecord, OutputWriter } from "../src/output";
 
 function record(overrides: Partial<FlatRecord> = {}): FlatRecord {
@@ -62,17 +62,17 @@ function record(overrides: Partial<FlatRecord> = {}): FlatRecord {
 }
 
 describe("atomic artifact publication", () => {
-  it("keeps the previous artifact when replacement is interrupted", () => {
+  it("keeps the previous artifact when replacement is interrupted", async () => {
     const directory = mkdtempSync(join(tmpdir(), "scraper-atomic-"));
     const target = join(directory, "results.jsonl");
     writeFileSync(target, "valid\n");
 
-    expect(() =>
-      atomicReplaceSync(target, (temporaryPath) => {
+    await expect(
+      atomicReplace(target, async (temporaryPath) => {
         writeFileSync(temporaryPath, "partial");
         throw new Error("interrupted");
       }),
-    ).toThrow("interrupted");
+    ).rejects.toThrow("interrupted");
 
     expect(readFileSync(target, "utf8")).toBe("valid\n");
     expect(existsSync(`${target}.tmp`)).toBe(false);

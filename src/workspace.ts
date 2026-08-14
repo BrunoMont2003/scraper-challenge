@@ -11,6 +11,8 @@ const OWNED_CHILDREN = [
   "results.csv.tmp",
   "failed.jsonl",
   "failed.jsonl.tmp",
+  "unresolved.jsonl",
+  "unresolved.jsonl.tmp",
   "pdfs",
   "words",
 ] as const;
@@ -20,7 +22,7 @@ export class ScraperWorkspace {
   readonly databasePath: string;
   readonly jsonlPath: string;
   readonly csvPath: string;
-  readonly failedPath: string;
+  readonly unresolvedPath: string;
   readonly pdfDirectory: string;
   readonly wordDirectory: string;
 
@@ -29,7 +31,7 @@ export class ScraperWorkspace {
     this.databasePath = join(root, "scraper.sqlite");
     this.jsonlPath = join(root, "results.jsonl");
     this.csvPath = join(root, "results.csv");
-    this.failedPath = join(root, "failed.jsonl");
+    this.unresolvedPath = join(root, "unresolved.jsonl");
     this.pdfDirectory = join(root, "pdfs");
     this.wordDirectory = join(root, "words");
   }
@@ -56,6 +58,14 @@ export class ScraperWorkspace {
       } else {
         rmSync(path, { recursive: true, force: true });
       }
+    }
+  }
+
+  /** Remove the superseded mixed-state manifest after its replacement is safely written. */
+  removeLegacyFailedManifest(): void {
+    for (const name of ["failed.jsonl", "failed.jsonl.tmp"]) {
+      const path = join(this.root, name);
+      if (lstatIfPresent(path)) rmSync(path, { force: true });
     }
   }
 }

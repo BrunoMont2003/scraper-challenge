@@ -15,7 +15,7 @@ export function parseCli(argv: string[]): CliOptions {
     .description(
       "Scraper de Jurisprudencia Nacional del Poder Judicial del Perú.\n" +
         "Paginación completa + extracción de metadata (card + ficha 'Ver Ficha')\n" +
-        "+ descarga de PDF/Word, con rate limiting adaptativo (AIMD) y cola idempotente.",
+        "+ descarga de PDF (Word opcional), con rate limiting adaptativo y cola idempotente.",
     )
     .option(
       "--query <texto>",
@@ -52,6 +52,7 @@ export function parseCli(argv: string[]): CliOptions {
     )
     .option("--out <dir>", "directorio de salida", DEFAULT_OPTIONS.out)
     .option("--fresh", "borrar los artefactos del scraper dentro de --out y empezar desde cero")
+    .option("--word", "descargar también archivos Word (PDF se descarga siempre)")
     .option("--quiet", "solo errores y resumen final")
     .showHelpAfterError()
     .parse(argv);
@@ -71,5 +72,6 @@ export function parseCli(argv: string[]): CliOptions {
     out: opts.out ?? DEFAULT_OPTIONS.out,
     fresh: Boolean(opts.fresh),
     quiet: Boolean(opts.quiet),
+    word: Boolean(opts.word),
   };
 }

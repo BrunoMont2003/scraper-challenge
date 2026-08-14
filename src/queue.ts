@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { type CardRecord, type DetailRecord, normalizeRunScope, type RunScope } from "./config";
 
-export type Status = "pending" | "in_progress" | "done" | "failed" | "missing";
+export type Status = "pending" | "in_progress" | "done" | "failed" | "missing" | "deferred";
 export type Operation = "detail" | "pdf" | "word";
 
 export interface PageRow {
@@ -33,11 +33,13 @@ export interface DocRow {
   word_error: string | null;
   pdf_path: string | null;
   word_path: string | null;
+  pdf_next_eligible_at: number | null;
+  word_next_eligible_at: number | null;
   detail_scraped_at: string | null;
   updated_at: string | null;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE runs (
@@ -77,6 +79,8 @@ CREATE TABLE docs (
   word_error         TEXT,
   pdf_path           TEXT,
   word_path          TEXT,
+  pdf_next_eligible_at INTEGER,
+  word_next_eligible_at INTEGER,
   detail_scraped_at  TEXT,
   updated_at         TEXT,
   PRIMARY KEY (run_id, uuid)
@@ -112,6 +116,12 @@ export class JobQueue {
       if (version === 0 && tableCount === 0) {
         this.db.exec(SCHEMA);
         this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      } else if (version === 2) {
+        this.db.transaction(() => {
+          this.db.exec("ALTER TABLE docs ADD COLUMN pdf_next_eligible_at INTEGER");
+          this.db.exec("ALTER TABLE docs ADD COLUMN word_next_eligible_at INTEGER");
+          this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        })();
       } else if (version !== SCHEMA_VERSION) {
         throw new IncompatibleSchemaError(version);
       }
@@ -224,12 +234,31 @@ export class JobQueue {
     const statusColumn = kind === "pdf" ? "pdf_status" : "word_status";
     const pathColumn = kind === "pdf" ? "pdf_path" : "word_path";
     const errorColumn = kind === "pdf" ? "pdf_error" : "word_error";
+    const eligibleColumn = kind === "pdf" ? "pdf_next_eligible_at" : "word_next_eligible_at";
     this.db
       .prepare(
-        `UPDATE docs SET ${statusColumn}=?, ${pathColumn}=?, ${errorColumn}=?, updated_at=datetime('now')
+        `UPDATE docs SET ${statusColumn}=?, ${pathColumn}=?, ${errorColumn}=?, ${eligibleColumn}=NULL, updated_at=datetime('now')
          WHERE run_id=? AND uuid=?`,
       )
       .run(status, path ?? null, error ?? null, runId, uuid);
+  }
+
+  deferFile(
+    runId: number,
+    uuid: string,
+    kind: "pdf" | "word",
+    nextEligibleAt: number,
+    error: string,
+  ): void {
+    const statusColumn = `${kind}_status`;
+    const errorColumn = `${kind}_error`;
+    const eligibleColumn = `${kind}_next_eligible_at`;
+    this.db
+      .prepare(
+        `UPDATE docs SET ${statusColumn}='deferred', ${errorColumn}=?, ${eligibleColumn}=?, updated_at=datetime('now')
+         WHERE run_id=? AND uuid=?`,
+      )
+      .run(error, nextEligibleAt, runId, uuid);
   }
 
   incrementAttempts(runId: number, uuid: string, operation: Operation): void {
@@ -253,12 +282,6 @@ export class JobQueue {
 
   getDoc(runId: number, uuid: string): DocRow | undefined {
     return this.selectDocs(`d.run_id=? AND d.uuid=?`).get(runId, uuid) as DocRow | undefined;
-  }
-
-  allDocs(runId: number): DocRow[] {
-    return this.selectDocs(`d.run_id=? AND d.detail_status='done'`, "d.page, d.row_index").all(
-      runId,
-    ) as DocRow[];
   }
 
   countDocs(runId: number): number {
@@ -309,24 +332,25 @@ export class JobQueue {
     }
   }
 
-  rowsForOutput(runId: number): Array<{ row: DocRow; metadata: Record<string, unknown> }> {
-    return Array.from(this.iterateRowsForOutput(runId));
-  }
-
   pendingDownloads(
     runId: number,
     kind: "pdf" | "word",
+    now: number = Date.now(),
+    maxAttempts: number = Number.MAX_SAFE_INTEGER,
   ): Array<{ docUuid: string; fileUuid: string; nroexp: string; attempts: number }> {
     const statusColumn = kind === "pdf" ? "pdf_status" : "word_status";
     const attemptsColumn = kind === "pdf" ? "pdf_attempts" : "word_attempts";
+    const eligibleColumn = kind === "pdf" ? "pdf_next_eligible_at" : "word_next_eligible_at";
     const rows = this.db
       .prepare(
         `SELECT uuid, metadata, ${attemptsColumn} AS attempts FROM docs
          WHERE run_id=? AND detail_status='done'
-           AND (${statusColumn}='pending' OR ${statusColumn}='failed')
+           AND (${statusColumn}='pending' OR ${statusColumn}='failed' OR ${statusColumn}='deferred')
+           AND ${attemptsColumn} < ?
+           AND (${eligibleColumn} IS NULL OR ${eligibleColumn} <= ?)
          ORDER BY ${attemptsColumn} ASC, page, row_index`,
       )
-      .all(runId) as Array<{ uuid: string; metadata: string; attempts: number }>;
+      .all(runId, maxAttempts, now) as Array<{ uuid: string; metadata: string; attempts: number }>;
     return rows.map((row) => {
       const metadata = this.parseMetadata(row.metadata);
       const detail = (metadata.detail ?? {}) as Record<string, unknown>;
@@ -340,13 +364,80 @@ export class JobQueue {
     });
   }
 
-  failedRows(runId: number): DocRow[] {
-    return Array.from(this.iterateFailedRows(runId));
+  deferredDownloadWindow(
+    runId: number,
+    kind: "pdf" | "word",
+    maxAttempts: number = Number.MAX_SAFE_INTEGER,
+    maxFiles = 0,
+  ): { count: number; nextEligibleAt: number | null } {
+    const statusColumn = `${kind}_status`;
+    const attemptsColumn = `${kind}_attempts`;
+    const eligibleColumn = `${kind}_next_eligible_at`;
+    return this.db
+      .prepare(
+        `WITH selected AS (
+           SELECT * FROM docs WHERE run_id=? AND detail_status='done'
+           ORDER BY page, row_index LIMIT ?
+         )
+         SELECT COUNT(*) AS count, MIN(${eligibleColumn}) AS nextEligibleAt
+         FROM selected
+         WHERE ${statusColumn}='deferred' AND ${attemptsColumn} < ?`,
+      )
+      .get(runId, maxFiles > 0 ? maxFiles : -1, maxAttempts) as {
+      count: number;
+      nextEligibleAt: number | null;
+    };
+  }
+
+  failExhaustedFiles(runId: number, kind: "pdf" | "word", maxAttempts: number): number {
+    const statusColumn = `${kind}_status`;
+    const attemptsColumn = `${kind}_attempts`;
+    const errorColumn = `${kind}_error`;
+    const eligibleColumn = `${kind}_next_eligible_at`;
+    return this.db
+      .prepare(
+        `UPDATE docs SET ${statusColumn}='failed', ${eligibleColumn}=NULL,
+           ${errorColumn}=COALESCE(${errorColumn}, 'descarga fallida') || ' · reintentos agotados',
+           updated_at=datetime('now')
+         WHERE run_id=? AND ${statusColumn}='deferred' AND ${attemptsColumn} >= ?`,
+      )
+      .run(runId, maxAttempts).changes;
+  }
+
+  artifactMetrics(
+    runId: number,
+    kinds: ReadonlyArray<"pdf" | "word">,
+    maxFilesPerKind = 0,
+  ): { requested: number; succeeded: number; failed: number; deferred: number; attempts: number } {
+    const result = { requested: 0, succeeded: 0, failed: 0, deferred: 0, attempts: 0 };
+    for (const kind of kinds) {
+      const row = this.db
+        .prepare(
+          `WITH selected AS (
+             SELECT * FROM docs WHERE run_id=? AND detail_status='done'
+             ORDER BY page, row_index
+             LIMIT ?
+           )
+           SELECT COUNT(*) AS requested,
+             SUM(CASE WHEN ${kind}_status='done' THEN 1 ELSE 0 END) AS succeeded,
+             SUM(CASE WHEN ${kind}_status IN ('failed','missing') THEN 1 ELSE 0 END) AS failed,
+             SUM(CASE WHEN ${kind}_status='deferred' THEN 1 ELSE 0 END) AS deferred,
+             SUM(${kind}_attempts) AS attempts
+           FROM selected`,
+        )
+        .get(runId, maxFilesPerKind > 0 ? maxFilesPerKind : -1) as Record<
+        keyof typeof result,
+        number | null
+      >;
+      for (const key of Object.keys(result) as Array<keyof typeof result>)
+        result[key] += row[key] ?? 0;
+    }
+    return result;
   }
 
   iterateFailedRows(runId: number): IterableIterator<DocRow> {
     return this.selectDocs(
-      `d.run_id=? AND (d.detail_status='failed' OR d.pdf_status='failed' OR d.word_status='failed')`,
+      `d.run_id=? AND (d.detail_status='failed' OR d.pdf_status IN ('failed','deferred') OR d.word_status IN ('failed','deferred'))`,
       "d.page, d.row_index",
     ).iterate(runId) as IterableIterator<DocRow>;
   }

@@ -2,14 +2,49 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { describe, expect, it } from "vitest";
+import axios from "axios";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Downloader } from "../src/download";
+import { HttpClient } from "../src/http/client";
+import { HostPacer } from "../src/ratelimit";
+
+vi.mock("axios", () => ({
+  default: { isAxiosError: vi.fn(() => false), request: vi.fn() },
+}));
+
+afterEach(() => vi.clearAllMocks());
 
 function pdfChunks(): Readable {
   return Readable.from([Buffer.from("%PDF-1.7\n"), Buffer.alloc(1200, 1)]);
 }
 
 describe("Downloader", () => {
+  it("reports every HTTP attempt and delegates retry waiting to the host throttle", async () => {
+    let now = 0;
+    const sleeps: number[] = [];
+    const observations: number[] = [];
+    const pacer = new HostPacer(0, {
+      now: () => now,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+      random: () => 0,
+    });
+    vi.mocked(axios.request)
+      .mockResolvedValueOnce({ status: 429, headers: { "retry-after": "1" }, data: "limited" })
+      .mockResolvedValueOnce({ status: 200, headers: {}, data: "ok" });
+    const http = new HttpClient({
+      minDelayMs: 0,
+      pacer,
+      backoff: { maxAttempts: 1 },
+      onRequest: (observation) => observations.push(observation.status),
+    });
+
+    expect((await http.getText("https://example.test")).status).toBe(200);
+    expect(observations).toEqual([429, 200]);
+    expect(sleeps).toEqual([1_000]);
+  });
   it("publishes a streamed download only after validation", async () => {
     const directory = mkdtempSync(join(tmpdir(), "scraper-download-"));
     const http = {

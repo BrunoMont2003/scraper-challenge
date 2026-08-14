@@ -1,11 +1,12 @@
+import { relative } from "node:path";
 import { parseCli } from "./cli";
 import { type CliOptions, normalizeRunScope, type SearchFilters } from "./config";
 import { Downloader, type FileKind } from "./download";
-import { HttpClient } from "./http/client";
-import { Logger, type RunStats } from "./logger";
+import { HttpClient, type RequestObservation } from "./http/client";
 import { OutputWriter, toFlatRecord } from "./output";
 import { type DocRow, JobQueue } from "./queue";
-import { AdaptiveSemaphore, AimdController, crossRunDelay, HostPacer } from "./ratelimit";
+import { AdaptiveSemaphore, AimdController, HostPacer } from "./ratelimit";
+import { type RunPhase, RunReporter, type RunStats, terminalState } from "./reporter";
 import { processPageIsolated, SessionWorker } from "./session-worker";
 import { ScraperWorkspace } from "./workspace";
 
@@ -13,15 +14,22 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function requestedFileKinds(includeWord: boolean): FileKind[] {
+  return includeWord ? ["pdf", "word"] : ["pdf"];
+}
+
+export function requestedPhases(includeWord: boolean): RunPhase[] {
+  return includeWord
+    ? ["Search", "Details", "PDFs", "Word", "Export"]
+    : ["Search", "Details", "PDFs", "Export"];
 }
 
 interface Context {
   opts: CliOptions;
   filters: SearchFilters;
-  logger: Logger;
+  logger: RunReporter;
   aimd: AimdController;
+  pacer: HostPacer;
   queue: JobQueue;
   runId: number;
   workspace: ScraperWorkspace;
@@ -29,6 +37,14 @@ interface Context {
   downloader: Downloader;
   output: OutputWriter;
   stats: RunStats;
+}
+
+export function canReuseCompletedCrawl(
+  queue: Pick<JobQueue, "pendingPages">,
+  runId: number,
+  requestedPages: number,
+): boolean {
+  return requestedPages > 0 && queue.pendingPages(runId, requestedPages).length === 0;
 }
 
 /** Procesa las páginas asignadas a una sesión (paginar + ficha de cada card). */
@@ -86,7 +102,7 @@ async function crawlPagesWithWorker(
     queue.markPage(ctx.runId, page, pageFailed ? "failed" : "done");
     if (pageFailed) stats.pagesFailed++;
     else stats.pagesDone++;
-    logger.progress(`pág ${page} | docs ${stats.detailDone} | fallos ${stats.detailFailed}`);
+    logger.progress(stats.pagesDone + stats.pagesFailed);
   }
 }
 
@@ -97,8 +113,21 @@ async function crawlPagesWithWorker(
 async function crawlPhase(ctx: Context): Promise<void> {
   const { opts, filters, logger, workers } = ctx;
 
+  if (canReuseCompletedCrawl(ctx.queue, ctx.runId, opts.pages)) {
+    logger.phaseSkipped(
+      "Search",
+      `${opts.pages} páginas reutilizadas · No fue necesario consultar el sitio`,
+    );
+    logger.phaseSkipped(
+      "Details",
+      `${ctx.queue.countDetails(ctx.runId, "done")} detalles reutilizados · Nada pendiente`,
+    );
+    return;
+  }
+
   const primary = workers[0]!;
-  logger.info(`Búsqueda: "${filters.query}" (corte=${filters.corte})`);
+  logger.phaseStarted("Search");
+  logger.info(`Consulta: "${filters.query}"`);
   const pageData = await primary.ensureSearched(filters);
   if (pageData.lastPage === 0 || pageData.cards.length === 0) {
     throw new Error(
@@ -106,12 +135,20 @@ async function crawlPhase(ctx: Context): Promise<void> {
     );
   }
   logger.info(
-    `Total: ${pageData.totalResults.toLocaleString("en")} resultados | ${pageData.lastPage.toLocaleString("en")} páginas`,
+    `Encontrados: ${pageData.totalResults.toLocaleString("en")} expedientes · ${pageData.lastPage.toLocaleString("en")} páginas disponibles`,
   );
 
   const lastPage = opts.pages > 0 ? Math.min(pageData.lastPage, opts.pages) : pageData.lastPage;
 
   const pendingPages = ctx.queue.pendingPages(ctx.runId, lastPage);
+  if (pendingPages.length === 0) {
+    logger.phaseSkipped(
+      "Details",
+      `${ctx.queue.countDetails(ctx.runId, "done")} detalles reutilizados · Nada pendiente`,
+    );
+    return;
+  }
+  logger.phaseStarted("Details", pendingPages.length);
   const assignments: number[][] = workers.map(() => []);
   for (const page of pendingPages) {
     assignments[(page - 1) % workers.length]!.push(page);
@@ -124,17 +161,50 @@ async function crawlPhase(ctx: Context): Promise<void> {
  *  Los fallidos quedan marcados en la cola y se reintentan en la
  *  siguiente corrida (idempotente), nunca abortan el resto. */
 async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
-  let jobs = ctx.queue.pendingDownloads(ctx.runId, kind);
-  if (ctx.opts.maxFiles > 0) {
-    const done = ctx.queue.countFiles(ctx.runId, kind, "done");
-    jobs = jobs.slice(0, Math.max(0, ctx.opts.maxFiles - done));
+  const maxArtifactAttempts = 3;
+  ctx.queue.failExhaustedFiles(ctx.runId, kind, maxArtifactAttempts);
+  const loadJobs = () => {
+    let pending = ctx.queue.pendingDownloads(ctx.runId, kind, Date.now(), maxArtifactAttempts);
+    if (ctx.opts.maxFiles > 0) {
+      const done = ctx.queue.countFiles(ctx.runId, kind, "done");
+      pending = pending.slice(0, Math.max(0, ctx.opts.maxFiles - done));
+    }
+    return pending;
+  };
+  let jobs = loadJobs();
+  const done = ctx.queue.countFiles(ctx.runId, kind, "done");
+  const reused = ctx.opts.maxFiles > 0 ? Math.min(done, ctx.opts.maxFiles) : done;
+  ctx.stats.filesReused += reused;
+  const phase = kind === "pdf" ? "PDFs" : "Word";
+  if (jobs.length === 0) {
+    const deferred = ctx.queue.deferredDownloadWindow(
+      ctx.runId,
+      kind,
+      maxArtifactAttempts,
+      ctx.opts.maxFiles,
+    );
+    const waitMs = Math.max(0, (deferred.nextEligibleAt ?? 0) - Date.now());
+    if (deferred.count > 0 && waitMs > 0 && waitMs <= 60_000) {
+      ctx.logger.phaseWaiting(phase, deferred.count, deferred.nextEligibleAt!);
+      await new Promise((resolve) => setTimeout(resolve, waitMs + 25));
+      jobs = loadJobs();
+    }
+    if (jobs.length === 0) {
+      const message =
+        deferred.count > 0
+          ? `${reused} disponibles · ${deferred.count} en pausa por límite del servidor`
+          : `${reused} archivos reutilizados · Nada pendiente`;
+      ctx.logger.phaseSkipped(phase, message);
+      return;
+    }
   }
-  if (jobs.length === 0) return;
-
-  ctx.logger.info(`Descargando ${jobs.length} archivos ${kind.toUpperCase()}...`);
+  ctx.logger.phaseStarted(phase, jobs.length);
+  if (reused > 0) ctx.logger.info(`${reused} archivos reutilizados · ${jobs.length} por descargar`);
 
   const sem = new AdaptiveSemaphore(() => ctx.aimd.concurrency);
   let idx = 0;
+  let completedJobs = 0;
+  let rateLimitCircuitOpen = false;
 
   const worker = async (): Promise<void> => {
     for (;;) {
@@ -146,42 +216,67 @@ async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
       }
       idx += 1;
 
-      if (job.attempts > 0) await sleep(crossRunDelay(job.attempts));
-
       try {
+        if (rateLimitCircuitOpen) {
+          ctx.queue.deferFile(
+            ctx.runId,
+            job.docUuid,
+            kind,
+            Math.max(Date.now() + 30_000, ctx.pacer.cooldownUntil),
+            "Diferido porque el límite del servidor pausó la fase de descargas",
+          );
+          ctx.stats.filesDeferred++;
+          continue;
+        }
         if (!job.fileUuid) {
           ctx.queue.markFile(ctx.runId, job.docUuid, kind, "missing");
           continue;
         }
+        ctx.queue.incrementAttempts(ctx.runId, job.docUuid, kind);
         const outcome = await ctx.downloader.download(job.fileUuid, kind, job.nroexp);
         if (outcome.ok) {
           ctx.queue.markFile(ctx.runId, job.docUuid, kind, "done", outcome.path);
           if (kind === "pdf") ctx.stats.pdfsDone++;
           else ctx.stats.wordsDone++;
+          ctx.stats.filesDownloadedNow++;
         } else if (outcome.missing) {
           ctx.queue.markFile(ctx.runId, job.docUuid, kind, "missing");
         } else {
-          ctx.queue.incrementAttempts(ctx.runId, job.docUuid, kind);
-          ctx.queue.markFile(ctx.runId, job.docUuid, kind, "failed", undefined, outcome.error);
-          ctx.stats.filesFailed++;
-          ctx.logger.warn(`${kind} fallido ${job.nroexp}: ${outcome.error}`);
+          if (outcome.error?.includes("HTTP 429")) {
+            rateLimitCircuitOpen = true;
+            ctx.queue.deferFile(
+              ctx.runId,
+              job.docUuid,
+              kind,
+              Math.max(Date.now() + 30_000, ctx.pacer.cooldownUntil),
+              outcome.error,
+            );
+            ctx.stats.filesDeferred++;
+          } else {
+            ctx.queue.markFile(ctx.runId, job.docUuid, kind, "failed", undefined, outcome.error);
+            ctx.stats.filesFailed++;
+            ctx.logger.warn(`${kind} fallido ${job.nroexp}: ${outcome.error}`);
+          }
         }
       } catch (err) {
-        ctx.queue.incrementAttempts(ctx.runId, job.docUuid, kind);
         ctx.queue.markFile(ctx.runId, job.docUuid, kind, "failed", undefined, errorMessage(err));
         ctx.stats.filesFailed++;
         ctx.logger.warn(`${kind} fallido ${job.nroexp}: ${errorMessage(err)}`);
       } finally {
+        completedJobs += 1;
+        ctx.logger.progress(completedJobs, jobs.length);
         sem.release();
       }
     }
   };
 
   await Promise.all(Array.from({ length: Math.min(ctx.aimd.maxConcurrency, jobs.length) }, worker));
+  ctx.queue.failExhaustedFiles(ctx.runId, kind, maxArtifactAttempts);
 }
 
 /** Fase 3: export final JSONL/CSV + manifest de fallidos. */
 function exportPhase(ctx: Context): void {
+  ctx.logger.phaseStarted("Export");
   const records = function* () {
     for (const { row, metadata } of ctx.queue.iterateRowsForOutput(ctx.runId)) {
       yield toOutputRecord(row, metadata);
@@ -189,11 +284,9 @@ function exportPhase(ctx: Context): void {
   };
 
   const recordCount = ctx.output.write(records());
-  ctx.logger.info(
-    `Escritos ${recordCount} registros a ${ctx.output.jsonlPath} y ${ctx.output.csvPath}`,
-  );
+  ctx.logger.info(`${recordCount} registros exportados`);
 
-  const failedPath = ctx.workspace.failedPath;
+  const unresolvedPath = ctx.workspace.unresolvedPath;
   const failures = function* () {
     for (const row of ctx.queue.iterateFailedRows(ctx.runId)) {
       yield {
@@ -208,9 +301,10 @@ function exportPhase(ctx: Context): void {
       };
     }
   };
-  const failedCount = ctx.output.writeFailures(failures(), failedPath);
-  if (failedCount > 0) {
-    ctx.logger.warn(`${failedCount} documentos con fallos → ${failedPath}`);
+  const unresolvedCount = ctx.output.writeFailures(failures(), unresolvedPath);
+  ctx.workspace.removeLegacyFailedManifest();
+  if (unresolvedCount > 0) {
+    ctx.logger.warn(`${unresolvedCount} documentos sin resolver registrados en unresolved.jsonl`);
   }
 }
 
@@ -235,8 +329,7 @@ export function toOutputRecord(row: DocRow, metadata: Record<string, unknown>) {
 async function runScraper(parsedOptions: CliOptions): Promise<number> {
   const workspace = ScraperWorkspace.open(parsedOptions.out);
   const opts: CliOptions = { ...parsedOptions, out: workspace.root };
-  const logger = new Logger();
-  logger.setSilent(opts.quiet);
+  const logger = new RunReporter({ quiet: opts.quiet });
 
   const filters: SearchFilters = normalizeRunScope({
     query: opts.query,
@@ -252,15 +345,25 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
 
   const aimd = new AimdController({ initialConcurrency: opts.concurrency });
   const pacer = new HostPacer(opts.minDelay);
+  let observeRequest = (_observation: RequestObservation): void => {
+    // Replaced before any network operation starts.
+  };
   const workers = Array.from(
     { length: opts.sessions },
-    () => new SessionWorker({ minDelayMs: opts.minDelay, pacer }),
+    () =>
+      new SessionWorker({
+        minDelayMs: opts.minDelay,
+        pacer,
+        onRequest: (observation) => observeRequest(observation),
+      }),
   );
   const downloadHttp = new HttpClient({
     cookie: () => "",
     minDelayMs: opts.minDelay,
     aimd,
     pacer,
+    backoff: { maxAttempts: 2 },
+    onRequest: (observation) => observeRequest(observation),
   });
 
   const queue = new JobQueue(workspace.databasePath);
@@ -269,6 +372,7 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
     filters,
     logger,
     aimd,
+    pacer,
     queue,
     runId: queue.getOrCreateRun(filters),
     workspace,
@@ -284,8 +388,21 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
       pdfsDone: 0,
       wordsDone: 0,
       filesFailed: 0,
+      filesDeferred: 0,
+      requestedArtifacts: 0,
+      filesDownloadedNow: 0,
+      filesReused: 0,
+      httpAttempts: 0,
+      retries: 0,
+      rateLimited: 0,
       startedAt: Date.now(),
     },
+  };
+  observeRequest = (observation): void => {
+    ctx.stats.httpAttempts++;
+    if (observation.retry) ctx.stats.retries++;
+    if (observation.status === 429) ctx.stats.rateLimited++;
+    logger.requestObserved(observation.status, observation.retry, pacer.cooldownUntil);
   };
 
   let queueClosed = false;
@@ -301,7 +418,7 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
     logger.warn("Interrupción (Ctrl+C) — el estado queda guardado; reintenta al volver a correr");
     try {
       ctx.stats.docsTotal = ctx.queue.countDocs(ctx.runId);
-      logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
+      logger.finish("ABORTED", ctx.stats, displayPath(ctx.workspace.root));
     } catch {
       /* la DB puede estar a media escritura */
     }
@@ -312,8 +429,8 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
 
   try {
     await crawlPhase(ctx);
-    await downloadPhase(ctx, "pdf");
-    await downloadPhase(ctx, "word");
+    const requestedKinds = requestedFileKinds(opts.word);
+    for (const kind of requestedKinds) await downloadPhase(ctx, kind);
     exportPhase(ctx);
 
     // Recomputar desde la cola: fuente de verdad, no contadores volátiles.
@@ -322,15 +439,25 @@ async function runScraper(parsedOptions: CliOptions): Promise<number> {
     ctx.stats.detailFailed = ctx.queue.countDetails(ctx.runId, "failed");
     ctx.stats.pdfsDone = ctx.queue.countFiles(ctx.runId, "pdf", "done");
     ctx.stats.wordsDone = ctx.queue.countFiles(ctx.runId, "word", "done");
-    ctx.stats.filesFailed = ctx.queue.countFailed(ctx.runId);
+    const artifacts = ctx.queue.artifactMetrics(ctx.runId, requestedKinds, opts.maxFiles);
+    ctx.stats.requestedArtifacts = artifacts.requested;
+    ctx.stats.filesFailed = artifacts.failed;
+    ctx.stats.filesDeferred = artifacts.deferred;
     ctx.stats.pagesDone = ctx.queue.countPages(ctx.runId, "done");
     ctx.stats.pagesFailed = ctx.queue.countPages(ctx.runId, "failed");
-    logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
-    return ctx.stats.pagesFailed + ctx.queue.countFailed(ctx.runId);
+    const failures = ctx.stats.pagesFailed + ctx.stats.detailFailed + artifacts.failed;
+    const state = terminalState({ aborted: false, failures, deferred: artifacts.deferred });
+    logger.finish(state, ctx.stats, displayPath(ctx.workspace.root));
+    return failures + artifacts.deferred;
   } finally {
     closeQueue();
     process.off("SIGINT", onSigint);
   }
+}
+
+function displayPath(path: string): string {
+  const local = relative(process.cwd(), path);
+  return local === "" ? "." : local.startsWith("..") ? path : local;
 }
 
 export type ExitCode = 0 | 1 | 2;
@@ -344,7 +471,7 @@ export async function main(
     const failures = await runner(parseCli(argv));
     return failures > 0 ? 1 : 0;
   } catch (error) {
-    new Logger().error(`Corrida abortada: ${errorMessage(error)}`);
+    new RunReporter().error(`Corrida abortada: ${errorMessage(error)}`);
     return 2;
   }
 }
