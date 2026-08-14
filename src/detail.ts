@@ -20,7 +20,7 @@ const AJAX_HEADERS = {
 
 /**
  * "Ver Ficha": POST AJAX parcial (JSF/RichFaces) que devuelve el popup con
- * la ficha completa del documento (docs/spec.md §5). El request reenvía el
+ * la ficha completa del documento (docs/site-protocol.md). El request reenvía el
  * formulario completo + ViewState + parámetros de metadata de la fila.
  */
 export class DetailClient {

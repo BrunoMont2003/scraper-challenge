@@ -102,7 +102,7 @@ async function crawlPhase(ctx: Context): Promise<void> {
   const pageData = await primary.ensureSearched(filters);
   if (pageData.lastPage === 0 || pageData.cards.length === 0) {
     throw new Error(
-      "La búsqueda no devolvió resultados (¿formulario incompleto? Ver docs/spec.md §2)",
+      "La búsqueda no devolvió resultados (¿formulario incompleto? Ver docs/site-protocol.md)",
     );
   }
   logger.info(

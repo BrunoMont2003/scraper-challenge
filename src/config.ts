@@ -198,7 +198,7 @@ export interface SearchFilters extends RunScope {}
 
 /**
  * Campos base del formulario de búsqueda que el servidor JSF espera.
- * Ver docs/spec.md §2 (búsqueda), §4 (paginación) y §5 (Ver Ficha).
+ * Ver docs/site-protocol.md para búsqueda, paginación y "Ver Ficha".
  */
 export function buildSearchFormValues(f: SearchFilters): Record<string, string> {
   return {
@@ -245,7 +245,7 @@ export function buildPaginationFormValues(f: SearchFilters, page: number): Recor
 
 /**
  * Campos completos del POST AJAX de "Ver Ficha"
- * (params exactos del request real capturado — ver docs/spec.md §5).
+ * (params exactos del request real capturado — ver docs/site-protocol.md).
  */
 export function buildDetailFormValues(
   f: SearchFilters,

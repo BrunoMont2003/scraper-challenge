@@ -4,7 +4,7 @@ import { SiteSession } from "./http/session";
 import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
- * Paginación (docs/spec.md §4): POST resultado.xhtml con spinner=N +
+ * Paginación (docs/site-protocol.md): POST resultado.xhtml con spinner=N +
  * botón j_idt447 → 200 con la página N (sin redirect).
  */
 export class Paginator {
