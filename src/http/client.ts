@@ -57,26 +57,27 @@ export class HttpClient {
     responseType: "text" | "arraybuffer" = "text",
     extraHeaders: Record<string, string> = {},
   ): Promise<HttpResult> {
-    await this.pacer.waitTurn();
     try {
-      const res = await axios.request({
-        method,
-        url,
-        data: data ?? undefined,
-        headers: {
-          "User-Agent": USER_AGENT,
-          Accept: "*/*",
-          "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
-          ...(data ? { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" } : {}),
-          ...(this.opts.cookie?.() ? { Cookie: this.opts.cookie() } : {}),
-          ...extraHeaders,
-        },
-        maxRedirects: 0,
-        validateStatus: () => true,
-        timeout: this.opts.timeoutMs ?? DEFAULT_TIMEOUT,
-        responseType,
-        transitional: { clarifyTimeoutError: true },
-      });
+      const res = await this.pacer.start(() =>
+        axios.request({
+          method,
+          url,
+          data: data ?? undefined,
+          headers: {
+            "User-Agent": USER_AGENT,
+            Accept: "*/*",
+            "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+            ...(data ? { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" } : {}),
+            ...(this.opts.cookie?.() ? { Cookie: this.opts.cookie() } : {}),
+            ...extraHeaders,
+          },
+          maxRedirects: 0,
+          validateStatus: () => true,
+          timeout: this.opts.timeoutMs ?? DEFAULT_TIMEOUT,
+          responseType,
+          transitional: { clarifyTimeoutError: true },
+        }),
+      );
       const headers: Record<string, string> = {};
       for (const [k, v] of Object.entries(res.headers)) {
         headers[k] = String(v);

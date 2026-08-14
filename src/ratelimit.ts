@@ -69,15 +69,43 @@ export function jitteredBackoff(opts: BackoffOptions, attempt: number): number {
  * so concurrent clients cannot observe and claim the same start slot.
  */
 export class HostPacer {
-  private nextStartAt = 0;
+  private lastStartAt = 0;
+  private turns: Promise<void> = Promise.resolve();
 
   constructor(private readonly minDelayMs: number) {}
 
   async waitTurn(): Promise<void> {
-    const now = Date.now();
-    const startAt = Math.max(now, this.nextStartAt);
-    this.nextStartAt = startAt + this.minDelayMs;
-    while (Date.now() < startAt) await sleep(startAt - Date.now());
+    await this.reserveTurn();
+  }
+
+  start<T>(operation: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.turns = this.turns.then(async () => {
+        await this.waitForDelay();
+        try {
+          const result = operation();
+          this.lastStartAt = Date.now();
+          resolve(result);
+        } catch (error) {
+          this.lastStartAt = Date.now();
+          reject(error);
+        }
+      });
+    });
+  }
+
+  private reserveTurn(): Promise<void> {
+    const turn = this.turns.then(async () => {
+      await this.waitForDelay();
+      this.lastStartAt = Date.now();
+    });
+    this.turns = turn;
+    return turn;
+  }
+
+  private async waitForDelay(): Promise<void> {
+    const elapsed = Date.now() - this.lastStartAt;
+    if (elapsed < this.minDelayMs) await sleep(this.minDelayMs - elapsed);
   }
 }
 
