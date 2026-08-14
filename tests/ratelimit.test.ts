@@ -1,12 +1,63 @@
-import { describe, expect, it } from "vitest";
+import axios from "axios";
+import { describe, expect, it, vi } from "vitest";
+import { HttpClient } from "../src/http/client";
 import {
   AdaptiveSemaphore,
   AimdController,
   crossRunDelay,
   DEFAULT_BACKOFF,
+  HostPacer,
   jitteredBackoff,
   parseRetryAfter,
 } from "../src/ratelimit";
+
+vi.mock("axios", () => ({
+  default: {
+    isAxiosError: vi.fn(() => false),
+    request: vi.fn(),
+  },
+}));
+
+describe("HostPacer", () => {
+  it("preserva el delay mínimo entre clientes concurrentes del mismo host", async () => {
+    const starts: number[] = [];
+    vi.mocked(axios.request).mockImplementation(async () => {
+      starts.push(Date.now());
+      return { status: 200, headers: {}, data: "ok" };
+    });
+    const pacer = new HostPacer(25);
+    const first = new HttpClient({ minDelayMs: 25, pacer });
+    const second = new HttpClient({ minDelayMs: 25, pacer });
+
+    await Promise.all([
+      first.getText("https://jurisprudencia.pj.gob.pe/one"),
+      second.getText("https://jurisprudencia.pj.gob.pe/two"),
+      first.getText("https://jurisprudencia.pj.gob.pe/three"),
+    ]);
+
+    expect(starts).toHaveLength(3);
+    expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(25);
+    expect(starts[2]! - starts[1]!).toBeGreaterThanOrEqual(25);
+  });
+
+  it("no comparte esperas entre pacers independientes", async () => {
+    const starts: number[] = [];
+    vi.mocked(axios.request).mockImplementation(async () => {
+      starts.push(Date.now());
+      return { status: 200, headers: {}, data: "ok" };
+    });
+    const first = new HttpClient({ minDelayMs: 100, pacer: new HostPacer(100) });
+    const second = new HttpClient({ minDelayMs: 100, pacer: new HostPacer(100) });
+
+    await Promise.all([
+      first.getText("https://one.example.test"),
+      second.getText("https://two.example.test"),
+    ]);
+
+    expect(starts).toHaveLength(2);
+    expect(starts[1]! - starts[0]!).toBeLessThan(50);
+  });
+});
 
 describe("parseRetryAfter", () => {
   it("parsea segundos", () => {

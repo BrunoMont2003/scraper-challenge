@@ -6,18 +6,12 @@ import { HttpClient } from "./http/client";
 import { Logger, type RunStats } from "./logger";
 import { OutputWriter, toFlatRecord } from "./output";
 import { JobQueue } from "./queue";
-import { AdaptiveSemaphore, AimdController, crossRunDelay } from "./ratelimit";
-import { SessionWorker } from "./session-worker";
+import { AdaptiveSemaphore, AimdController, crossRunDelay, HostPacer } from "./ratelimit";
+import { processPageIsolated, SessionWorker } from "./session-worker";
 import { ScraperWorkspace } from "./workspace";
-
-const MAX_RECOVERIES_PER_PAGE = 3;
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-function isViewExpired(err: unknown): boolean {
-  return err instanceof Error && /ViewExpired/i.test(err.message);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -55,13 +49,21 @@ async function crawlPagesWithWorker(
       continue;
     }
     queue.markPage(ctx.runId, page, "in_progress");
-    current = await worker.page(filters, page);
+    const fetched = await processPageIsolated(
+      page,
+      () => worker.fetchPageWithRecovery(filters, page),
+      (failedPage, error) => {
+        queue.markPage(ctx.runId, failedPage, "failed", errorMessage(error));
+        stats.pagesFailed++;
+        logger.warn(`página ${failedPage} fallida: ${errorMessage(error)}`);
+      },
+    );
+    if (!fetched) continue;
+    current = fetched;
 
-    let recoveries = 0;
     let pageFailed = false;
 
-    for (let i = 0; i < current.cards.length; i++) {
-      const card = current.cards[i]!;
+    for (const card of current.cards) {
       queue.insertCard(ctx.runId, page, card);
       const existing = queue.getDoc(ctx.runId, card.uuid);
       if (existing?.detail_status === "done") {
@@ -71,26 +73,20 @@ async function crawlPagesWithWorker(
 
       try {
         queue.incrementAttempts(ctx.runId, card.uuid, "detail");
-        const detail = await worker.detailClient.fetchDetail(filters, page, card);
+        const detail = await worker.fetchDetailWithRecovery(filters, page, card);
         queue.setDetail(ctx.runId, card.uuid, detail);
         stats.detailDone++;
-      } catch (err) {
-        if (isViewExpired(err) && recoveries < MAX_RECOVERIES_PER_PAGE) {
-          recoveries++;
-          await worker.recover(filters);
-          current = await worker.page(filters, page);
-          i--;
-          continue;
-        }
-        queue.markDetail(ctx.runId, card.uuid, "failed", errorMessage(err));
+      } catch (error) {
+        queue.markDetail(ctx.runId, card.uuid, "failed", errorMessage(error));
         pageFailed = true;
         stats.detailFailed++;
-        logger.warn(`detalle fallido ${card.nroexp}: ${errorMessage(err)}`);
+        logger.warn(`detalle fallido ${card.nroexp}: ${errorMessage(error)}`);
       }
     }
 
     queue.markPage(ctx.runId, page, pageFailed ? "failed" : "done");
-    stats.pagesDone++;
+    if (pageFailed) stats.pagesFailed++;
+    else stats.pagesDone++;
     logger.progress(`pág ${page} | docs ${stats.detailDone} | fallos ${stats.detailFailed}`);
   }
 }
@@ -257,11 +253,17 @@ async function main(): Promise<void> {
   }
 
   const aimd = new AimdController({ initialConcurrency: opts.concurrency });
+  const pacer = new HostPacer(opts.minDelay);
   const workers = Array.from(
     { length: opts.sessions },
-    () => new SessionWorker({ minDelayMs: opts.minDelay }),
+    () => new SessionWorker({ minDelayMs: opts.minDelay, pacer }),
   );
-  const downloadHttp = new HttpClient({ cookie: () => "", minDelayMs: opts.minDelay, aimd });
+  const downloadHttp = new HttpClient({
+    cookie: () => "",
+    minDelayMs: opts.minDelay,
+    aimd,
+    pacer,
+  });
 
   const queue = new JobQueue(workspace.databasePath);
   const ctx: Context = {

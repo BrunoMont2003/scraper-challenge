@@ -1,6 +1,6 @@
 import { buildSearchFormValues, type SearchFilters, SITE } from "./config";
 import type { HttpClient } from "./http/client";
-import { extractViewState, SiteSession } from "./http/session";
+import { SiteSession } from "./http/session";
 import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
@@ -42,8 +42,8 @@ export class SearchClient {
 
     // Si el resultado sigue siendo la página de inicio (búsqueda no disparada)
     // puede ser un POST incompleto — reintento controlado por el caller.
-    const parsed = parseResultsPage(body);
-    this.session.setViewState(extractViewState(body));
+    const parsed = parseResultsPage(body, { expectedPage: 1 });
+    this.session.setViewState(parsed.viewState);
     return parsed;
   }
 }

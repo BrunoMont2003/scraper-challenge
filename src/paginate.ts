@@ -1,6 +1,6 @@
 import { buildPaginationFormValues, type SearchFilters, SITE } from "./config";
 import type { HttpClient } from "./http/client";
-import { extractViewState, SiteSession } from "./http/session";
+import { SiteSession } from "./http/session";
 import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
@@ -24,8 +24,8 @@ export class Paginator {
       throw new Error("ViewExpiredException en paginación");
     }
 
-    const parsed = parseResultsPage(body);
-    this.session.setViewState(extractViewState(body));
+    const parsed = parseResultsPage(body, { expectedPage: page });
+    this.session.setViewState(parsed.viewState);
     return parsed;
   }
 }
