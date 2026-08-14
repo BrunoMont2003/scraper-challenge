@@ -1,11 +1,10 @@
-import { writeFileSync } from "node:fs";
 import { parseCli } from "./cli";
 import { type CliOptions, normalizeRunScope, type SearchFilters } from "./config";
 import { Downloader, type FileKind } from "./download";
 import { HttpClient } from "./http/client";
 import { Logger, type RunStats } from "./logger";
 import { OutputWriter, toFlatRecord } from "./output";
-import { JobQueue } from "./queue";
+import { type DocRow, JobQueue } from "./queue";
 import { AdaptiveSemaphore, AimdController, crossRunDelay, HostPacer } from "./ratelimit";
 import { processPageIsolated, SessionWorker } from "./session-worker";
 import { ScraperWorkspace } from "./workspace";
@@ -183,58 +182,57 @@ async function downloadPhase(ctx: Context, kind: FileKind): Promise<void> {
 
 /** Fase 3: export final JSONL/CSV + manifest de fallidos. */
 function exportPhase(ctx: Context): void {
-  const records = ctx.queue.rowsForOutput(ctx.runId).map(({ row, metadata }) => {
-    const card = (metadata.card ?? {}) as Record<string, string>;
-    const detail = (metadata.detail ?? {}) as Record<string, unknown>;
-    return toFlatRecord({
-      uuid: row.uuid,
-      recurso: String(card.recurso ?? ""),
-      nroexp: String(card.nroexp ?? ""),
-      card,
-      detail: detail as never,
-      query: row.query,
-      page: row.page,
-      rowIndex: row.row_index,
-      pdfPath: row.pdf_path ?? "",
-      wordPath: row.word_path ?? "",
-      scrapedAt: new Date().toISOString(),
-    });
-  });
+  const records = function* () {
+    for (const { row, metadata } of ctx.queue.iterateRowsForOutput(ctx.runId)) {
+      yield toOutputRecord(row, metadata);
+    }
+  };
 
+  const recordCount = ctx.output.write(records());
   ctx.logger.info(
-    `Escribiendo ${records.length} registros a ${ctx.output.jsonlPath} y ${ctx.output.csvPath}`,
+    `Escritos ${recordCount} registros a ${ctx.output.jsonlPath} y ${ctx.output.csvPath}`,
   );
-  ctx.output.writeJsonl(records);
-  ctx.output.writeCsv(records);
 
-  const failed = ctx.queue.failedRows(ctx.runId);
   const failedPath = ctx.workspace.failedPath;
-  writeFileSync(
-    failedPath,
-    failed.length > 0
-      ? failed
-          .map((row) =>
-            JSON.stringify({
-              uuid: row.uuid,
-              page: row.page,
-              detail_status: row.detail_status,
-              pdf_status: row.pdf_status,
-              word_status: row.word_status,
-              detail_error: row.detail_error,
-              pdf_error: row.pdf_error,
-              word_error: row.word_error,
-            }),
-          )
-          .join("\n") + "\n"
-      : "",
-  );
-  if (failed.length > 0) {
-    ctx.logger.warn(`${failed.length} documentos con fallos → ${failedPath}`);
+  const failures = function* () {
+    for (const row of ctx.queue.iterateFailedRows(ctx.runId)) {
+      yield {
+        uuid: row.uuid,
+        page: row.page,
+        detail_status: row.detail_status,
+        pdf_status: row.pdf_status,
+        word_status: row.word_status,
+        detail_error: row.detail_error,
+        pdf_error: row.pdf_error,
+        word_error: row.word_error,
+      };
+    }
+  };
+  const failedCount = ctx.output.writeFailures(failures(), failedPath);
+  if (failedCount > 0) {
+    ctx.logger.warn(`${failedCount} documentos con fallos → ${failedPath}`);
   }
 }
 
-async function main(): Promise<void> {
-  const parsedOptions = parseCli(process.argv);
+export function toOutputRecord(row: DocRow, metadata: Record<string, unknown>) {
+  const card = (metadata.card ?? {}) as Record<string, string>;
+  const detail = (metadata.detail ?? {}) as Record<string, unknown>;
+  return toFlatRecord({
+    uuid: row.uuid,
+    recurso: String(card.recurso ?? ""),
+    nroexp: String(card.nroexp ?? ""),
+    card,
+    detail: detail as never,
+    query: row.query,
+    page: row.page,
+    rowIndex: row.row_index,
+    pdfPath: row.pdf_path ?? "",
+    wordPath: row.word_path ?? "",
+    scrapedAt: row.detail_scraped_at ?? "",
+  });
+}
+
+async function runScraper(parsedOptions: CliOptions): Promise<number> {
   const workspace = ScraperWorkspace.open(parsedOptions.out);
   const opts: CliOptions = { ...parsedOptions, out: workspace.root };
   const logger = new Logger();
@@ -328,13 +326,31 @@ async function main(): Promise<void> {
     ctx.stats.pagesDone = ctx.queue.countPages(ctx.runId, "done");
     ctx.stats.pagesFailed = ctx.queue.countPages(ctx.runId, "failed");
     logger.summarize(ctx.stats, { query: filters.query, concurrency: aimd.concurrency });
-  } catch (err) {
-    logger.error(`Corrida abortada: ${errorMessage(err)}`);
-    process.exitCode = 1;
+    return ctx.stats.pagesFailed + ctx.queue.countFailed(ctx.runId);
   } finally {
     closeQueue();
     process.off("SIGINT", onSigint);
   }
 }
 
-void main();
+export type ExitCode = 0 | 1 | 2;
+export type ScraperRunner = (options: CliOptions) => Promise<number>;
+
+export async function main(
+  argv: string[] = process.argv,
+  runner: ScraperRunner = runScraper,
+): Promise<ExitCode> {
+  try {
+    const failures = await runner(parseCli(argv));
+    return failures > 0 ? 1 : 0;
+  } catch (error) {
+    new Logger().error(`Corrida abortada: ${errorMessage(error)}`);
+    return 2;
+  }
+}
+
+if (require.main === module) {
+  void main(process.argv).then((code) => {
+    process.exitCode = code;
+  });
+}

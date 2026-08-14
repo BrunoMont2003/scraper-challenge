@@ -1,3 +1,4 @@
+import type { Readable } from "node:stream";
 import axios from "axios";
 import { USER_AGENT } from "../config";
 import {
@@ -14,6 +15,12 @@ export interface HttpResult {
   status: number;
   headers: Record<string, string>;
   data: string | Buffer;
+}
+
+export interface HttpStreamResult {
+  status: number;
+  headers: Record<string, string>;
+  data: Readable;
 }
 
 export interface ClientOptions {
@@ -173,6 +180,75 @@ export class HttpClient {
   async getBinary(url: string): Promise<HttpResult> {
     const { result } = await this.requestWithRedirects("GET", url, undefined, "arraybuffer");
     return result;
+  }
+
+  private async requestStreamOnce(url: string): Promise<HttpStreamResult> {
+    try {
+      const res = await this.pacer.start(() =>
+        axios.request({
+          method: "GET",
+          url,
+          headers: {
+            "User-Agent": USER_AGENT,
+            Accept: "*/*",
+            "Accept-Language": "es-PE,es;q=0.9,en;q=0.8",
+            ...(this.opts.cookie?.() ? { Cookie: this.opts.cookie() } : {}),
+          },
+          maxRedirects: 0,
+          validateStatus: () => true,
+          timeout: this.opts.timeoutMs ?? DEFAULT_TIMEOUT,
+          responseType: "stream",
+          transitional: { clarifyTimeoutError: true },
+        }),
+      );
+      const headers: Record<string, string> = {};
+      for (const [key, value] of Object.entries(res.headers)) headers[key] = String(value);
+      return { status: res.status, headers, data: res.data as Readable };
+    } catch (error) {
+      throw new NetworkError(error);
+    }
+  }
+
+  private async requestStream(url: string): Promise<HttpStreamResult> {
+    let attempt = 0;
+    for (;;) {
+      try {
+        const result = await this.requestStreamOnce(url);
+        if (result.status === 429 || (result.status >= 500 && result.status <= 599)) {
+          const signal: RateSignal = result.status === 429 ? "rate-limited" : "server-error";
+          this.aimd?.report(signal);
+          if (attempt >= this.backoff.maxAttempts) return result;
+          result.data.destroy();
+          const retryAfter = parseRetryAfter(result.headers["retry-after"]);
+          await sleep(retryAfter ?? jitteredBackoff(this.backoff, attempt));
+          attempt++;
+          continue;
+        }
+        this.aimd?.report("success");
+        return result;
+      } catch (error) {
+        this.aimd?.report("network-error");
+        if (attempt >= this.backoff.maxAttempts) throw error;
+        await sleep(jitteredBackoff(this.backoff, attempt));
+        attempt++;
+      }
+    }
+  }
+
+  /** GET streamed with the same redirect, retry, and pacing policy as other requests. */
+  async getStream(url: string): Promise<HttpStreamResult> {
+    let currentUrl = url;
+    for (let hop = 0; hop < 10; hop++) {
+      const result = await this.requestStream(currentUrl);
+      const location = result.headers.location;
+      if (REDIRECT_CODES.has(result.status) && location) {
+        result.data.destroy();
+        currentUrl = new URL(rewriteToHttps(location), currentUrl).toString();
+        continue;
+      }
+      return result;
+    }
+    throw new Error("Demasiados redirects");
   }
 }
 

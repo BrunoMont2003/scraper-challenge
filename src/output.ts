@@ -1,5 +1,6 @@
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { commitTemporary, removeTemporary, temporarySibling } from "./atomic-file";
 import type { DetailRecord } from "./config";
 
 /** Registro plano de salida (1 por documento). */
@@ -109,6 +110,11 @@ export const CSV_COLUMNS: Array<keyof FlatRecord> = [
   "scraped_at",
 ];
 
+export function csvEscape(value: unknown): string {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
 export function toFlatRecord(input: {
   uuid: string;
   recurso: string;
@@ -187,27 +193,61 @@ export class OutputWriter {
     this.csvPath = join(outDir, "results.csv");
   }
 
-  /** Append incremental (idempotente por uuid: el caller controla dupes). */
-  appendJsonl(record: FlatRecord): void {
-    appendFileSync(this.jsonlPath, JSON.stringify(record) + "\n");
-  }
+  /** Writes both complete exports from a single bounded-memory iterable. */
+  write(records: Iterable<FlatRecord>): number {
+    const jsonlTemporary = temporarySibling(this.jsonlPath);
+    const csvTemporary = temporarySibling(this.csvPath);
+    removeTemporary(jsonlTemporary);
+    removeTemporary(csvTemporary);
 
-  /** Escribe el JSONL completo (una línea por registro). */
-  writeJsonl(records: FlatRecord[]): void {
-    const lines = records.map((record) => JSON.stringify(record)).join("\n");
-    writeFileSync(this.jsonlPath, lines + "\n");
-  }
-
-  /** Reescribe el CSV completo desde los registros dados. */
-  writeCsv(records: FlatRecord[]): void {
-    const csvEscape = (value: unknown): string => {
-      const s = String(value ?? "");
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const lines = [CSV_COLUMNS.join(",")];
-    for (const record of records) {
-      lines.push(CSV_COLUMNS.map((col) => csvEscape(record[col])).join(","));
+    let jsonlFd: number | undefined;
+    let csvFd: number | undefined;
+    let count = 0;
+    try {
+      jsonlFd = openSync(jsonlTemporary, "wx");
+      csvFd = openSync(csvTemporary, "wx");
+      writeSync(csvFd, `${CSV_COLUMNS.join(",")}\n`);
+      for (const record of records) {
+        writeSync(jsonlFd, `${JSON.stringify(record)}\n`);
+        writeSync(csvFd, `${CSV_COLUMNS.map((column) => csvEscape(record[column])).join(",")}\n`);
+        count++;
+      }
+      closeSync(jsonlFd);
+      jsonlFd = undefined;
+      closeSync(csvFd);
+      csvFd = undefined;
+      if (statSync(csvTemporary).size === 0) throw new Error("CSV export validation failed");
+      commitTemporary(jsonlTemporary, this.jsonlPath);
+      commitTemporary(csvTemporary, this.csvPath);
+      return count;
+    } catch (error) {
+      if (jsonlFd !== undefined) closeSync(jsonlFd);
+      if (csvFd !== undefined) closeSync(csvFd);
+      removeTemporary(jsonlTemporary);
+      removeTemporary(csvTemporary);
+      throw error;
     }
-    writeFileSync(this.csvPath, lines.join("\n") + "\n");
+  }
+
+  writeFailures(records: Iterable<Record<string, unknown>>, targetPath: string): number {
+    const temporary = temporarySibling(targetPath);
+    removeTemporary(temporary);
+    let fd: number | undefined;
+    let count = 0;
+    try {
+      fd = openSync(temporary, "wx");
+      for (const record of records) {
+        writeSync(fd, `${JSON.stringify(record)}\n`);
+        count++;
+      }
+      closeSync(fd);
+      fd = undefined;
+      commitTemporary(temporary, targetPath);
+      return count;
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      removeTemporary(temporary);
+      throw error;
+    }
   }
 }

@@ -10,6 +10,7 @@
     "lint": "biome check src tests",
     "lint:fix": "biome check --write src tests",
     "test": "vitest run",
+    "test:live": "tsx tests/live-smoke.ts",
     "test:watch": "vitest"
   },
   "keywords": [
