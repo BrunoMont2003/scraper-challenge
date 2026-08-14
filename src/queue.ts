@@ -341,10 +341,14 @@ export class JobQueue {
   }
 
   failedRows(runId: number): DocRow[] {
+    return Array.from(this.iterateFailedRows(runId));
+  }
+
+  iterateFailedRows(runId: number): IterableIterator<DocRow> {
     return this.selectDocs(
       `d.run_id=? AND (d.detail_status='failed' OR d.pdf_status='failed' OR d.word_status='failed')`,
       "d.page, d.row_index",
-    ).all(runId) as DocRow[];
+    ).iterate(runId) as IterableIterator<DocRow>;
   }
 
   private countByStatus(runId: number, column: string, status: Status): number {
