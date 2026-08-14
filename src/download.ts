@@ -19,7 +19,7 @@ export interface StreamingHttpClient {
 }
 
 /**
- * Descarga de archivos vía ServletDescarga?uuid= (docs/spec.md §6).
+ * Descarga de archivos vía ServletDescarga?uuid= (docs/site-protocol.md).
  * No requiere sesión: el uuid es direccionable globalmente.
  */
 export class Downloader {

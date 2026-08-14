@@ -4,7 +4,7 @@ import { SiteSession } from "./http/session";
 import { type ParsedResultsPage, parseResultsPage } from "./parser";
 
 /**
- * Flujo de búsqueda (docs/spec.md §2):
+ * Flujo de búsqueda (docs/site-protocol.md):
  * GET inicio (sesión) → POST inicio con coordenadas del botón imagen →
  * 302 a resultado.xhtml (Location http:// → https://) → HTML de resultados.
  */
