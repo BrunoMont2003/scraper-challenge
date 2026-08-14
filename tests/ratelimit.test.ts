@@ -95,11 +95,17 @@ describe("HostPacer", () => {
   });
   it("preserva el delay mínimo entre clientes concurrentes del mismo host", async () => {
     const starts: number[] = [];
+    let now = 0;
     vi.mocked(axios.request).mockImplementation(async () => {
-      starts.push(Date.now());
+      starts.push(now);
       return { status: 200, headers: {}, data: "ok" };
     });
-    const pacer = new HostPacer(25);
+    const pacer = new HostPacer(25, {
+      now: () => now,
+      sleep: async (ms) => {
+        now += ms;
+      },
+    });
     const first = new HttpClient({ minDelayMs: 25, pacer });
     const second = new HttpClient({ minDelayMs: 25, pacer });
 
